@@ -343,6 +343,18 @@ impl<'a> LogWriter<'a> {
 		}
 	}
 
+	pub fn insert_index_range(&mut self, table: IndexTableId, index: u64, sub: u8, num: u8, data: &IndexChunk) {
+		let mask = (1u64 << num) - 1u64 << sub;
+		match self.log.local_index.entry(table).or_default().map.entry(index) {
+			std::collections::hash_map::Entry::Occupied(mut entry) => {
+				*entry.get_mut() = (self.log.record_id, entry.get().1 | mask, *data);
+			},
+			std::collections::hash_map::Entry::Vacant(entry) => {
+				entry.insert((self.log.record_id, mask, *data));
+			},
+		}
+	}
+
 	pub fn insert_value(&mut self, table: ValueTableId, index: u64, data: Vec<u8>) {
 		self.log
 			.local_values

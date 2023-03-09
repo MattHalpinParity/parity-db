@@ -16,6 +16,9 @@ use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::convert::TryInto;
+use std::{
+	sync::atomic::{AtomicU64, Ordering},
+};
 
 // Index chunk consists of 8 64-bit entries.
 const CHUNK_LEN: usize = CHUNK_ENTRIES * ENTRY_BYTES; // 512 bytes
@@ -128,6 +131,7 @@ pub struct IndexTable {
 	pub id: TableId,
 	map: RwLock<Option<memmap2::MmapMut>>,
 	path: std::path::PathBuf,
+	num_entries: AtomicU64,
 }
 
 fn total_entries(index_bits: u8) -> u64 {
@@ -203,13 +207,13 @@ impl IndexTable {
 		try_io!(file.set_len(file_size(id.index_bits())));
 		let map = try_io!(unsafe { memmap2::MmapMut::map_mut(&file) });
 		log::debug!(target: "parity-db", "Opened existing index {}", id);
-		Ok(Some(IndexTable { id, path, map: RwLock::new(Some(map)) }))
+		Ok(Some(IndexTable { id, path, map: RwLock::new(Some(map)), num_entries: AtomicU64::new(0) }))
 	}
 
 	pub fn create_new(path: &std::path::Path, id: TableId) -> IndexTable {
 		let mut path: std::path::PathBuf = path.into();
 		path.push(id.file_name());
-		IndexTable { id, path, map: RwLock::new(None) }
+		IndexTable { id, path, map: RwLock::new(None), num_entries: AtomicU64::new(0) }
 	}
 
 	pub fn load_stats(&self) -> Result<ColumnStats> {
@@ -302,6 +306,45 @@ impl IndexTable {
 		(Entry::empty(), 0)
 	}
 
+	fn chunk_partition_point(
+		chunk: &[u8; CHUNK_LEN],
+		partial_key: u64,
+		index_bits: u8,
+		num: usize
+	) -> usize {
+		// Binary search
+		let mut first = 0;
+		let mut last = num - 1;
+
+		while last > (first + 1) {
+			let mid = first + ((last - first) / 2);
+			let entry = Self::read_entry(chunk, mid);
+
+			if !entry.is_empty() && entry.partial_key(index_bits) < partial_key {
+				first = mid;
+			}
+			else {
+				last = mid;
+			}
+		}
+
+		if first == 0 {
+			let entry = Self::read_entry(chunk, 0);
+			if entry.is_empty() || entry.partial_key(index_bits) >= partial_key {
+				return 0
+			}
+		}
+
+		if last == (num - 1) {
+			let entry = Self::read_entry(chunk, last);
+			if !entry.is_empty() && entry.partial_key(index_bits) < partial_key {
+				return num
+			}
+		}
+
+		last
+	}
+
 	#[cfg(any(not(target_arch = "x86_64"), test))]
 	fn find_entry_base(
 		&self,
@@ -310,12 +353,62 @@ impl IndexTable {
 		chunk: &[u8; CHUNK_LEN],
 	) -> (Entry, usize) {
 		let partial_key = Entry::extract_key(key_prefix, self.id.index_bits());
-		for i in sub_index..CHUNK_ENTRIES {
-			let entry = Self::read_entry(chunk, i);
+
+		// Binary search
+		if sub_index > 0 {
+			// Already did a binary search in a previous call so just continue with a linear search as the entry should be close (if it exists)
+			for i in sub_index..CHUNK_ENTRIES {
+				let entry = Self::read_entry(chunk, i);
+				let entry_partial_key = entry.partial_key(self.id.index_bits());
+				if entry_partial_key == partial_key {
+					return (entry, i)
+				}
+				if entry_partial_key > partial_key || entry.is_empty() {
+					return (Entry::empty(), 0)
+				}
+			}
+			return (Entry::empty(), 0)
+		}
+		
+		// Estimate of number of entries. Can use this to reduce range of binary search.
+		let mut num_estimate = std::cmp::max(3, std::cmp::min(CHUNK_ENTRIES, ((self.num_entries.load(Ordering::Relaxed)) / total_chunks(self.id.index_bits())) as usize));
+
+		if num_estimate < CHUNK_ENTRIES {
+			// Is it worth binary searching the reduced range or is the key after it?
+			let entry = Self::read_entry(chunk, num_estimate);
+
 			if entry.partial_key(self.id.index_bits()) == partial_key {
-				return (entry, i)
+				// Might be in the middle of a span of equal keys. Need to find first.
+				// Also need to include this one in the search, hence the increment.
+				num_estimate += 1;
+			}
+			else if !entry.is_empty() && entry.partial_key(self.id.index_bits()) < partial_key {
+				// Key is after, so do a linear search from there
+				if num_estimate == (CHUNK_ENTRIES - 1) {
+					return (Entry::empty(), 0)
+				}
+				for i in num_estimate + 1..CHUNK_ENTRIES {
+					let entry = Self::read_entry(chunk, i);
+					let entry_partial_key = entry.partial_key(self.id.index_bits());
+					if entry_partial_key == partial_key {
+						return (entry, i)
+					}
+					if entry_partial_key > partial_key || entry.is_empty() {
+						return (Entry::empty(), 0)
+					}
+				}
+				return (Entry::empty(), 0)
 			}
 		}
+
+		let index_to_check = Self::chunk_partition_point(chunk, partial_key, self.id.index_bits(), num_estimate as usize);
+		if index_to_check < num_estimate {
+			let entry = Self::read_entry(chunk, index_to_check);
+			if entry.partial_key(self.id.index_bits()) == partial_key {
+				return (entry, index_to_check)
+			}
+		}
+
 		(Entry::empty(), 0)
 	}
 
@@ -421,15 +514,33 @@ impl IndexTable {
 			log.insert_index(self.id, chunk_index, i as u8, &chunk);
 			return Ok(PlanOutcome::Written)
 		}
-		for i in 0..CHUNK_ENTRIES {
-			let entry = Self::read_entry(&chunk, i);
-			if entry.is_empty() {
-				Self::write_entry(&new_entry, i, &mut chunk);
-				log::trace!(target: "parity-db", "{}: Inserted at {}.{}: {}", self.id, chunk_index, i, new_entry.address(self.id.index_bits()));
-				log.insert_index(self.id, chunk_index, i as u8, &chunk);
-				return Ok(PlanOutcome::Written)
+
+		let entries = Self::transmute_chunk(chunk);
+		let first_empty_index = entries.partition_point(|x| !x.is_empty());
+		if first_empty_index < CHUNK_ENTRIES {
+			let insert_index = match first_empty_index {
+				0 => 0,
+				_ => match entries[0..first_empty_index].binary_search_by(|probe| probe.partial_key(self.id.index_bits()).cmp(&partial_key)) {
+					Ok(val) => val,
+					Err(val) => val
+				}
+			};
+
+			// Shift entries (insert_index..first_empty_index) up by one.
+			if insert_index < first_empty_index {
+				chunk.copy_within(insert_index * 8..first_empty_index * 8, insert_index * 8 + 8);
 			}
+
+			// Write new entry at insert_index
+			Self::write_entry(&new_entry, insert_index, &mut chunk);
+
+			self.num_entries.fetch_add(1, Ordering::Relaxed);
+
+			log::trace!(target: "parity-db", "{}: Inserted at {}.{}: {}", self.id, chunk_index, insert_index, new_entry.address(self.id.index_bits()));
+			log.insert_index_range(self.id, chunk_index, insert_index as u8, ((first_empty_index - insert_index) + 1) as u8, &chunk);
+			return Ok(PlanOutcome::Written)
 		}
+
 		log::trace!(target: "parity-db", "{}: Index chunk full at {}", self.id, chunk_index);
 		Ok(PlanOutcome::NeedReindex)
 	}
@@ -474,8 +585,18 @@ impl IndexTable {
 		let entry = Self::read_entry(&chunk, i);
 		if !entry.is_empty() && entry.partial_key(self.id.index_bits()) == partial_key {
 			let new_entry = Entry::empty();
-			Self::write_entry(&new_entry, i, &mut chunk);
-			log.insert_index(self.id, chunk_index, i as u8, &chunk);
+
+			let entries = Self::transmute_chunk(chunk);
+			// first_empty_index must be greater than i
+			let first_empty_index = entries.partition_point(|x| !x.is_empty());
+			if (i + 1) < first_empty_index {
+				chunk.copy_within(i * 8 + 8..first_empty_index * 8, i * 8);
+			}
+			Self::write_entry(&new_entry, first_empty_index - 1, &mut chunk);
+			log.insert_index_range(self.id, chunk_index, i as u8, ((first_empty_index - i) + 1) as u8, &chunk);
+
+			self.num_entries.fetch_sub(1, Ordering::Relaxed);
+
 			log::trace!(target: "parity-db", "{}: Removed at {}.{}", self.id, chunk_index, i);
 			return Ok(PlanOutcome::Written)
 		}
