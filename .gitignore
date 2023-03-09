@@ -15,6 +15,7 @@ Cargo.lock
 *.log
 test_db/
 test_db_stress/
+run_data/
 
 # vim
 *.swp

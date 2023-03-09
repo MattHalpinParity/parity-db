@@ -13,7 +13,7 @@ use std::{
 		atomic::{AtomicBool, AtomicUsize, Ordering},
 		Arc,
 	},
-	thread,
+	thread, io::Write,
 };
 
 static COMMITS: AtomicUsize = AtomicUsize::new(0);
@@ -80,6 +80,9 @@ pub struct Stress {
 	/// Use uniform keys.
 	#[clap(long)]
 	pub uniform: bool,
+
+	#[clap(long)]
+	pub run_data_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -95,6 +98,7 @@ pub struct Args {
 	pub compress: bool,
 	pub ordered: bool,
 	pub uniform: bool,
+	pub run_data_name: Option<String>,
 }
 
 impl Stress {
@@ -111,6 +115,7 @@ impl Stress {
 			compress: self.compress,
 			ordered: self.ordered,
 			uniform: self.uniform,
+			run_data_name: self.run_data_name.clone(),
 		}
 	}
 }
@@ -367,7 +372,7 @@ pub fn run_internal(args: Args, db: Db) {
 
 	let commits = COMMITS.load(Ordering::SeqCst);
 	let commits = commits - start_commit;
-	let elapsed = start.elapsed().as_secs_f64();
+	let commit_elapsed = start.elapsed().as_secs_f64();
 
 	let hits = QUERIES_HIT.load(Ordering::SeqCst);
 	let misses = QUERIES_MISS.load(Ordering::SeqCst);
@@ -376,12 +381,12 @@ pub fn run_internal(args: Args, db: Db) {
 	println!(
 		"Completed {} commits in {} seconds. {} cps. {} hits, {} misses, {} iterations, {} qps",
 		commits,
-		elapsed,
-		commits as f64 / elapsed,
+		commit_elapsed,
+		commits as f64 / commit_elapsed,
 		hits,
 		misses,
 		iterations,
-		(hits + misses) as f64 / elapsed,
+		(hits + misses) as f64 / commit_elapsed,
 	);
 
 	if args.no_check {
@@ -428,4 +433,28 @@ pub fn run_internal(args: Args, db: Db) {
 		elapsed,
 		queries as f64 / elapsed
 	);
+
+	// Write run data
+	if let Some(run_data_name) = args.run_data_name.as_deref() {
+		let mut path = std::env::current_dir().expect("Cannot resolve current dir");
+		path.push("run_data");
+		std::fs::create_dir_all(&path).expect("Failed to create run_data directory");
+		path.push("stress_test_data.txt");
+
+		let file = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(path.as_path()).expect("Failed to open stress_test_data file");
+
+		let empty = file.metadata().unwrap().len() == 0;
+
+		let mut writer = std::io::BufWriter::new(file);
+
+		if empty {
+			writer.write_all("Name, Commits, Pruning, Commit Time, Query Time\n".as_bytes()).expect("Unable to write data");
+		}
+
+		let data_line = format!("{},{},{},{},{}\n", run_data_name, args.commits, !args.archive, commit_elapsed, elapsed);
+		writer.write_all(data_line.as_bytes()).expect("Unable to write data");
+	}
 }
