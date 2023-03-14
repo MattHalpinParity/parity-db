@@ -8,11 +8,11 @@ RUN_DATA_NAME=$(git rev-parse --abbrev-ref HEAD)
 RUN_WITHOUT_ARCHIVE=true
 RUN_WITH_ARCHIVE=true
 
-NUM_SAMPLES=3
+NUM_SAMPLES=1
 
 echo Dataset name: ${RUN_DATA_NAME}
 
-for c in 10000 15000 20000 40000 60000 100000;
+for c in 10000 15000 20000 40000 60000 80000 100000 125000 150000 175000 200000;
 do
 	echo Executing with ${c} commits
 	for ((i=0; i<$NUM_SAMPLES; i++));

@@ -426,12 +426,12 @@ pub fn run_internal(args: Args, db: Db) {
 		}
 	}
 
-	let elapsed = start.elapsed().as_secs_f64();
+	let query_elapsed = start.elapsed().as_secs_f64();
 	println!(
 		"Completed {} queries in {} seconds. {} qps",
 		queries,
-		elapsed,
-		queries as f64 / elapsed
+		query_elapsed,
+		queries as f64 / query_elapsed
 	);
 
 	// Write run data
@@ -451,10 +451,10 @@ pub fn run_internal(args: Args, db: Db) {
 		let mut writer = std::io::BufWriter::new(file);
 
 		if empty {
-			writer.write_all("Name, Commits, Pruning, Commit Time, Query Time\n".as_bytes()).expect("Unable to write data");
+			writer.write_all("Name, Commits, Archive, Compress, Ordered, Uniform, Commit Time, Query Time\n".as_bytes()).expect("Unable to write data");
 		}
 
-		let data_line = format!("{},{},{},{},{}\n", run_data_name, args.commits, !args.archive, commit_elapsed, elapsed);
+		let data_line = format!("{},{},{},{},{},{},{},{}\n", run_data_name, args.commits, args.archive, args.compress, args.ordered, args.uniform, commit_elapsed, query_elapsed);
 		writer.write_all(data_line.as_bytes()).expect("Unable to write data");
 	}
 }
