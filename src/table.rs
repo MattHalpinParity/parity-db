@@ -186,6 +186,18 @@ impl Entry<[u8; MAX_ENTRY_BUF_SIZE]> {
 
 impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 	#[inline(always)]
+	pub fn check_remaining_len(
+		&self,
+		len: usize,
+		error: impl Fn() -> crate::error::Error,
+	) -> Result<()> {
+		if self.0 + len > self.1.as_ref().len() {
+			return Err(error())
+		}
+		Ok(())
+	}
+
+	#[inline(always)]
 	pub fn new(data: B) -> Self {
 		Entry(0, data)
 	}
@@ -365,9 +377,7 @@ impl ValueTable {
 			None => (true, 4096),
 		};
 		assert!(entry_size >= MIN_ENTRY_SIZE as u16);
-		if db_version >= 4 {
-			assert!(entry_size <= MAX_ENTRY_SIZE as u16);
-		}
+		assert!(entry_size <= MAX_ENTRY_SIZE as u16);
 
 		let mut filepath: std::path::PathBuf = std::path::PathBuf::clone(&*path);
 		filepath.push(id.file_name());

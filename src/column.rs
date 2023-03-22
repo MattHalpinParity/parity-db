@@ -137,12 +137,30 @@ pub fn hash_key(key: &[u8], salt: &Salt, uniform: bool, db_version: u32) -> Key 
 	if uniform {
 		if db_version <= 5 {
 			k.copy_from_slice(&key[0..32]);
-		} else {
-			// For keys that are hashes already we do a simple XOR with salt.
+		} else if db_version <= 7 {
+			// XOR with salt.
 			let key = &key[0..32];
 			for i in 0..32 {
 				k[i] = key[i] ^ salt[i];
 			}
+		} else {
+			#[cfg(any(test, feature = "instrumentation"))]
+			// Used for forcing collisions in tests.
+			if salt == &Salt::default() {
+				k.copy_from_slice(&key);
+				return k
+			}
+			// siphash 1-3 first 128 bits of the key
+			use siphasher::sip128::Hasher128;
+			use std::hash::Hasher;
+			let mut hasher = siphasher::sip128::SipHasher13::new_with_key(
+				salt[..16].try_into().expect("Salt length is 32"),
+			);
+			hasher.write(&key);
+			let hash = hasher.finish128();
+			k[0..8].copy_from_slice(&hash.h1.to_le_bytes());
+			k[8..16].copy_from_slice(&hash.h2.to_le_bytes());
+			k[16..].copy_from_slice(&key[16..]);
 		}
 	} else {
 		let mut ctx = Blake2bMac::<U32>::new_with_salt_and_personal(salt, &[], &[])
@@ -425,7 +443,7 @@ impl HashColumn {
 		while let PlanOutcome::NeedReindex =
 			tables.index.write_insert_plan(key, address, None, log)?
 		{
-			log::info!(target: "parity-db", "{}: Index chunk full {} when reindexing", tables.index.id, hex(key));
+			log::debug!(target: "parity-db", "{}: Index chunk full {} when reindexing", tables.index.id, hex(key));
 			(tables, reindex) = Self::trigger_reindex(tables, reindex, self.path.as_path());
 			outcome = PlanOutcome::NeedReindex;
 		}
@@ -762,15 +780,9 @@ impl HashColumn {
 				if entry.is_empty() {
 					continue
 				}
-				let (size_tier, offset) = if self.db_version >= 4 {
+				let (size_tier, offset) = {
 					let address = entry.address(source.id.index_bits());
 					(address.size_tier(), address.offset())
-				} else {
-					let addr_bits = source.id.index_bits() + 10;
-					let address = Address::from_u64(entry.as_u64() & ((1u64 << addr_bits) - 1));
-					let size_tier = (address.as_u64() & 0x0f) as u8;
-					let offset = address.as_u64() >> 4;
-					(size_tier, offset)
 				};
 
 				if skip_preimage_indexes &&
