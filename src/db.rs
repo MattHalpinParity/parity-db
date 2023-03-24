@@ -20,7 +20,7 @@
 
 use crate::{
 	btree::{commit_overlay::BTreeChangeSet, BTreeIterator, BTreeTable},
-	column::{hash_key, ColId, Column, IterState, ReindexBatch},
+	column::{hash_key, ColId, Column, IterState, ReindexBatch, ValueIterState},
 	error::{try_io, Error, Result},
 	hash::IdentityBuildHasher,
 	index::PlanOutcome,
@@ -786,7 +786,7 @@ impl DbInner {
 				// to no attempt any further log enactment.
 				log::debug!(target: "parity-db", "Shutdown with error state {}", err);
 				self.log.clean_logs(self.log.num_dirty_logs())?;
-				return self.log.kill_logs()
+				return Ok(())
 			}
 		}
 		log::debug!(target: "parity-db", "Processing leftover commits");
@@ -853,40 +853,50 @@ impl DbInner {
 		}
 	}
 
-	fn iter_column_while(&self, c: ColId, f: impl FnMut(IterState) -> bool) -> Result<()> {
+	fn iter_column_while(&self, c: ColId, f: impl FnMut(ValueIterState) -> bool) -> Result<()> {
 		match &self.columns[c as usize] {
-			Column::Hash(column) => column.iter_while(&self.log, f),
+			Column::Hash(column) => column.iter_values(&self.log, f),
+			Column::Tree(_) => unimplemented!(),
+		}
+	}
+
+	fn iter_column_index_while(&self, c: ColId, f: impl FnMut(IterState) -> bool) -> Result<()> {
+		match &self.columns[c as usize] {
+			Column::Hash(column) => column.iter_index(&self.log, f),
 			Column::Tree(_) => unimplemented!(),
 		}
 	}
 }
 
+/// Database instance.
 pub struct Db {
 	inner: Arc<DbInner>,
 	commit_thread: Option<thread::JoinHandle<()>>,
 	flush_thread: Option<thread::JoinHandle<()>>,
 	log_thread: Option<thread::JoinHandle<()>>,
 	cleanup_thread: Option<thread::JoinHandle<()>>,
-	join_on_shutdown: bool,
 }
 
 impl Db {
-	pub fn with_columns(path: &std::path::Path, num_columns: u8) -> Result<Db> {
+	#[cfg(test)]
+	pub(crate) fn with_columns(path: &std::path::Path, num_columns: u8) -> Result<Db> {
 		let options = Options::with_columns(path, num_columns);
 		Self::open_inner(&options, OpeningMode::Create)
 	}
 
-	/// Open the database with given options.
+	/// Open the database with given options. An error will be returned if the database does not
+	/// exist.
 	pub fn open(options: &Options) -> Result<Db> {
 		Self::open_inner(options, OpeningMode::Write)
 	}
 
-	/// Create the database using given options.
+	/// Open the database using given options. If the database does not exist it will be created
+	/// empty.
 	pub fn open_or_create(options: &Options) -> Result<Db> {
 		Self::open_inner(options, OpeningMode::Create)
 	}
 
-	/// Read the database using given options
+	/// Open an existing database in read-only mode.
 	pub fn open_read_only(options: &Options) -> Result<Db> {
 		Self::open_inner(options, OpeningMode::ReadOnly)
 	}
@@ -943,14 +953,7 @@ impl Db {
 		} else {
 			None
 		};
-		Ok(Db {
-			inner: db,
-			commit_thread,
-			flush_thread,
-			log_thread,
-			cleanup_thread,
-			join_on_shutdown: start_threads,
-		})
+		Ok(Db { inner: db, commit_thread, flush_thread, log_thread, cleanup_thread })
 	}
 
 	/// Get a value in a specified column by key. Returns `None` if the key does not exist.
@@ -996,11 +999,22 @@ impl Db {
 	}
 
 	/// Iterate a column and call a function for each value. This is only supported for columns with
+	/// `btree_index` set to `false`. Iteration order is unspecified.
+	/// Unlike `get` the iteration may not include changes made in recent `commit` calls.
+	pub fn iter_column_while(&self, c: ColId, f: impl FnMut(ValueIterState) -> bool) -> Result<()> {
+		self.inner.iter_column_while(c, f)
+	}
+
+	/// Iterate a column and call a function for each value. This is only supported for columns with
 	/// `btree_index` set to `false`. Iteration order is unspecified. Note that the
 	/// `key` field in the state is the hash of the original key.
-	/// Unlinke `get` the iteration may not include changes made in recent `commit` calls.
-	pub fn iter_column_while(&self, c: ColId, f: impl FnMut(IterState) -> bool) -> Result<()> {
-		self.inner.iter_column_while(c, f)
+	/// Unlike `get` the iteration may not include changes made in recent `commit` calls.
+	pub(crate) fn iter_column_index_while(
+		&self,
+		c: ColId,
+		f: impl FnMut(IterState) -> bool,
+	) -> Result<()> {
+		self.inner.iter_column_index_while(c, f)
 	}
 
 	fn commit_worker(db: Arc<DbInner>) -> Result<()> {
@@ -1060,6 +1074,7 @@ impl Db {
 		Ok(())
 	}
 
+	/// Dump full database stats to the text output.
 	pub fn write_stats_text(
 		&self,
 		writer: &mut impl std::io::Write,
@@ -1068,6 +1083,7 @@ impl Db {
 		self.inner.write_stats_text(writer, column)
 	}
 
+	/// Reset internal database statistics for the database or specified column.
 	pub fn clear_stats(&self, column: Option<u8>) -> Result<()> {
 		self.inner.clear_stats(column)
 	}
@@ -1140,31 +1156,29 @@ impl Db {
 
 impl Drop for Db {
 	fn drop(&mut self) {
-		if self.join_on_shutdown {
-			self.inner.shutdown();
-			if let Some(t) = self.log_thread.take() {
-				if let Err(e) = t.join() {
-					log::warn!(target: "parity-db", "Log thread shutdown error: {:?}", e);
-				}
+		self.inner.shutdown();
+		if let Some(t) = self.log_thread.take() {
+			if let Err(e) = t.join() {
+				log::warn!(target: "parity-db", "Log thread shutdown error: {:?}", e);
 			}
-			if let Some(t) = self.flush_thread.take() {
-				if let Err(e) = t.join() {
-					log::warn!(target: "parity-db", "Flush thread shutdown error: {:?}", e);
-				}
+		}
+		if let Some(t) = self.flush_thread.take() {
+			if let Err(e) = t.join() {
+				log::warn!(target: "parity-db", "Flush thread shutdown error: {:?}", e);
 			}
-			if let Some(t) = self.commit_thread.take() {
-				if let Err(e) = t.join() {
-					log::warn!(target: "parity-db", "Commit thread shutdown error: {:?}", e);
-				}
+		}
+		if let Some(t) = self.commit_thread.take() {
+			if let Err(e) = t.join() {
+				log::warn!(target: "parity-db", "Commit thread shutdown error: {:?}", e);
 			}
-			if let Some(t) = self.cleanup_thread.take() {
-				if let Err(e) = t.join() {
-					log::warn!(target: "parity-db", "Cleanup thread shutdown error: {:?}", e);
-				}
+		}
+		if let Some(t) = self.cleanup_thread.take() {
+			if let Err(e) = t.join() {
+				log::warn!(target: "parity-db", "Cleanup thread shutdown error: {:?}", e);
 			}
-			if let Err(e) = self.inner.kill_logs() {
-				log::warn!(target: "parity-db", "Shutdown error: {:?}", e);
-			}
+		}
+		if let Err(e) = self.inner.kill_logs() {
+			log::warn!(target: "parity-db", "Shutdown error: {:?}", e);
 		}
 	}
 }
@@ -1428,20 +1442,30 @@ impl IndexedChangeSet {
 
 /// Verification operation utilities.
 pub mod check {
+	/// Database dump verbosity.
 	pub enum CheckDisplay {
+		/// Don't output any data.
 		None,
+		/// Output full data.
 		Full,
+		/// Limit value output to the specified size.
 		Short(u64),
 	}
 
+	/// Options for producing a database dump.
 	pub struct CheckOptions {
+		/// Only process this column. If this is `None` all columns will be processed.
 		pub column: Option<u8>,
+		/// Start with this index.
 		pub from: Option<u64>,
+		/// End with this index.
 		pub bound: Option<u64>,
+		/// Verbosity.
 		pub display: CheckDisplay,
 	}
 
 	impl CheckOptions {
+		/// Create a new instance.
 		pub fn new(
 			column: Option<u8>,
 			from: Option<u64>,
@@ -2447,6 +2471,41 @@ mod tests {
 		for _ in 0..100 {
 			let next = iter.prev().unwrap();
 			assert_eq!(iter_state_rev.next(), next.as_ref().map(|(k, v)| (k, v)));
+		}
+	}
+
+	#[cfg(feature = "instrumentation")]
+	#[test]
+	fn test_recover_from_log_on_error() {
+		let tmp = tempdir().unwrap();
+		let mut options = Options::with_columns(tmp.path(), 1);
+		options.always_flush = true;
+		options.with_background_thread = false;
+
+		// We do 2 commits and we fail while enacting the second one
+		{
+			let db = Db::open_or_create(&options).unwrap();
+			db.commit::<_, Vec<u8>>(vec![(0, vec![0], Some(vec![0]))]).unwrap();
+			db.process_commits().unwrap();
+			db.flush_logs().unwrap();
+			db.enact_logs().unwrap();
+			db.commit::<_, Vec<u8>>(vec![(0, vec![1], Some(vec![1]))]).unwrap();
+			db.process_commits().unwrap();
+			db.flush_logs().unwrap();
+			crate::set_number_of_allowed_io_operations(4);
+
+			// Set the background error explicitly as background threads are disabled in tests.
+			let err = db.enact_logs();
+			assert!(err.is_err());
+			db.inner.store_err(err);
+			crate::set_number_of_allowed_io_operations(usize::MAX);
+		}
+
+		// Open the databases and check that both values are there.
+		{
+			let db = Db::open(&options).unwrap();
+			assert_eq!(db.get(0, &[0]).unwrap(), Some(vec![0]));
+			assert_eq!(db.get(0, &[1]).unwrap(), Some(vec![1]));
 		}
 	}
 

@@ -11,7 +11,7 @@ use rand::{RngCore, SeedableRng};
 use std::{
 	sync::{
 		atomic::{AtomicBool, AtomicUsize, Ordering},
-		Arc,
+		Arc, Mutex,
 	},
 	thread, io::Write,
 };
@@ -81,8 +81,25 @@ pub struct Stress {
 	#[clap(long)]
 	pub uniform: bool,
 
+	/// Writer threads sleep after this many commits.
+	#[clap(long)]
+	pub writer_commits_per_sleep: Option<u64>,
+
+	/// Time (in milliseconds) writer threads sleep between commits.
+	#[clap(long)]
+	pub writer_sleep_time: Option<u64>,
+
+	/// By default reader threads will only test existing values. This option makes them also test
+	/// pruned values.
+	#[clap(long)]
+	pub reader_check_pruned: bool,
+
 	#[clap(long)]
 	pub run_data_name: Option<String>,
+
+	/// A timing sample is taken after each of this many commits and is written to run data.
+	#[clap(long)]
+	pub commits_per_timing_sample: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -98,7 +115,11 @@ pub struct Args {
 	pub compress: bool,
 	pub ordered: bool,
 	pub uniform: bool,
+	pub writer_commits_per_sleep: u64,
+	pub writer_sleep_time: u64,
+	pub reader_check_pruned: bool,
 	pub run_data_name: Option<String>,
+	pub commits_per_timing_sample: u64,
 }
 
 impl Stress {
@@ -115,7 +136,11 @@ impl Stress {
 			compress: self.compress,
 			ordered: self.ordered,
 			uniform: self.uniform,
+			writer_commits_per_sleep: self.writer_commits_per_sleep.unwrap_or(100),
+			writer_sleep_time: self.writer_sleep_time.unwrap_or(0),
+			reader_check_pruned: self.reader_check_pruned,
 			run_data_name: self.run_data_name.clone(),
+			commits_per_timing_sample: self.commits_per_timing_sample.unwrap_or(0),
 		}
 	}
 }
@@ -195,6 +220,12 @@ impl SizePool {
 	}
 }
 
+struct TimingSample {
+	pub commits: u64,
+	pub instant: std::time::Instant,
+	pub queries: u64,
+}
+
 fn informant(shutdown: Arc<AtomicBool>, total: usize, start: usize) {
 	let mut last = start;
 	let mut last_time = std::time::Instant::now();
@@ -219,12 +250,14 @@ fn writer(
 	pool: Arc<SizePool>,
 	shutdown: Arc<AtomicBool>,
 	start_commit: usize,
+	timing_samples: Arc<Mutex<Vec<TimingSample>>>,
 ) {
 	let offset = args.seed.unwrap_or(0);
 	// Note that multiple worker will run on same range concurrently.
 	let commit_size = COMMIT_SIZE;
 	let mut commit = Vec::with_capacity(commit_size);
 
+	let mut num_commits_done: u64 = 0;
 	loop {
 		let n = NEXT_COMMIT.fetch_add(1, Ordering::SeqCst);
 		if n >= start_commit + args.commits || shutdown.load(Ordering::Relaxed) {
@@ -247,10 +280,32 @@ fn writer(
 		db.commit(commit.drain(..).map(|(k, v)| (0, k, v))).unwrap();
 		COMMITS.fetch_add(1, Ordering::Relaxed);
 		commit.clear();
+
+		num_commits_done += 1;
+
+		if args.commits_per_timing_sample > 0 {
+			let finished_commit = n + 1;
+			if finished_commit as u64 % args.commits_per_timing_sample == 0 {
+				let now = std::time::Instant::now();
+				let queries = QUERIES_HIT.load(Ordering::Relaxed) as u64 + QUERIES_MISS.load(Ordering::Relaxed) as u64;
+				timing_samples.lock().unwrap().push(TimingSample { commits: finished_commit as u64, instant: now, queries: queries });
+			}
+		}
+
+		if num_commits_done % args.writer_commits_per_sleep == 0 && args.writer_sleep_time > 0 {
+			thread::sleep(std::time::Duration::from_millis(args.writer_sleep_time));
+		}
 	}
 }
 
-fn reader(db: Arc<Db>, pool: Arc<SizePool>, seed: u64, index: u64, shutdown: Arc<AtomicBool>) {
+fn reader(
+	db: Arc<Db>,
+	args: Arc<Args>,
+	pool: Arc<SizePool>,
+	seed: u64,
+	index: u64,
+	shutdown: Arc<AtomicBool>,
+) {
 	// Query random keys while writing
 	let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + index);
 	while !shutdown.load(Ordering::Relaxed) {
@@ -258,8 +313,16 @@ fn reader(db: Arc<Db>, pool: Arc<SizePool>, seed: u64, index: u64, shutdown: Arc
 		if commits == 0 {
 			continue
 		}
-		let num_keys = commits * COMMIT_SIZE as u64;
-		let key = pool.key(rng.next_u64() % num_keys + seed);
+		let key = if args.archive || args.reader_check_pruned {
+			let num_keys = commits * COMMIT_SIZE as u64;
+			pool.key(rng.next_u64() % num_keys + seed)
+		} else {
+			let num_commit_values = (COMMIT_SIZE - COMMIT_PRUNE_SIZE) as u64;
+			let num_keys = commits * num_commit_values;
+			let mut index = rng.next_u64() % num_keys;
+			index += (index / num_commit_values + 1) * COMMIT_PRUNE_SIZE as u64;
+			pool.key(index + seed)
+		};
 		match db.get(0, &key).unwrap() {
 			Some(_) => {
 				QUERIES_HIT.fetch_add(1, Ordering::SeqCst);
@@ -309,7 +372,10 @@ pub fn run_internal(args: Args, db: Db) {
 	}
 	let pool = Arc::new(pool);
 
-	let start = std::time::Instant::now();
+	let timing_samples: Mutex<Vec<TimingSample>> = Mutex::new(Default::default());
+	let timing_samples = Arc::new(timing_samples);
+
+	let commit_start = std::time::Instant::now();
 
 	COMMITS.store(start_commit, Ordering::SeqCst);
 	NEXT_COMMIT.store(start_commit, Ordering::SeqCst);
@@ -326,11 +392,12 @@ pub fn run_internal(args: Args, db: Db) {
 		let shutdown = shutdown.clone();
 		let offset = args.seed.unwrap_or(0);
 		let pool = pool.clone();
+		let args = args.clone();
 
 		threads.push(
 			thread::Builder::new()
 				.name(format!("reader {i}"))
-				.spawn(move || reader(db, pool, offset, i as u64, shutdown))
+				.spawn(move || reader(db, args, pool, offset, i as u64, shutdown))
 				.unwrap(),
 		);
 	}
@@ -352,11 +419,12 @@ pub fn run_internal(args: Args, db: Db) {
 		let shutdown = shutdown.clone();
 		let pool = pool.clone();
 		let args = args.clone();
+		let timing_samples = timing_samples.clone();
 
 		threads.push(
 			thread::Builder::new()
 				.name(format!("writer {i}"))
-				.spawn(move || writer(db, args, pool, shutdown, start_commit))
+				.spawn(move || writer(db, args, pool, shutdown, start_commit, timing_samples))
 				.unwrap(),
 		);
 	}
@@ -372,7 +440,7 @@ pub fn run_internal(args: Args, db: Db) {
 
 	let commits = COMMITS.load(Ordering::SeqCst);
 	let commits = commits - start_commit;
-	let commit_elapsed = start.elapsed().as_secs_f64();
+	let commit_elapsed = commit_start.elapsed().as_secs_f64();
 
 	let hits = QUERIES_HIT.load(Ordering::SeqCst);
 	let misses = QUERIES_MISS.load(Ordering::SeqCst);
@@ -394,7 +462,7 @@ pub fn run_internal(args: Args, db: Db) {
 	}
 
 	// Verify content
-	let start = std::time::Instant::now();
+	let query_start = std::time::Instant::now();
 	let pruned_per_commit = if args.archive { 0u64 } else { COMMIT_PRUNE_SIZE as u64 };
 	let mut queries = 0;
 	for nc in start_commit as u64..(start_commit + commits) as u64 {
@@ -426,7 +494,7 @@ pub fn run_internal(args: Args, db: Db) {
 		}
 	}
 
-	let query_elapsed = start.elapsed().as_secs_f64();
+	let query_elapsed = query_start.elapsed().as_secs_f64();
 	println!(
 		"Completed {} queries in {} seconds. {} qps",
 		queries,
@@ -451,10 +519,27 @@ pub fn run_internal(args: Args, db: Db) {
 		let mut writer = std::io::BufWriter::new(file);
 
 		if empty {
-			writer.write_all("Name, Commits, Archive, Compress, Ordered, Uniform, Commit Time, Query Time\n".as_bytes()).expect("Unable to write data");
+			writer.write_all("Name, Archive, Compress, Ordered, Uniform, Readers, Progressive, Total Commits, Total Commit Time, Num Commits, Commit Time, Num Queries, Query Time\n".as_bytes()).expect("Unable to write data");
 		}
 
-		let data_line = format!("{},{},{},{},{},{},{},{}\n", run_data_name, args.commits, args.archive, args.compress, args.ordered, args.uniform, commit_elapsed, query_elapsed);
+		let timing_samples = timing_samples.lock().unwrap();
+		if timing_samples.len() > 0 {
+			let mut prev_sample = &TimingSample { commits: 0, instant: commit_start.clone(), queries: 0 };
+			for sample in timing_samples.iter() {
+				let num_commits = sample.commits - prev_sample.commits;
+				let duration = (sample.instant - prev_sample.instant).as_secs_f64();
+				let num_queries = sample.queries - prev_sample.queries;
+
+				let total_commit_time = (sample.instant - commit_start).as_secs_f64();
+
+				let data_line = format!("{},{},{},{},{},{},{},{},{},{},{},{},{}\n", run_data_name, args.archive, args.compress, args.ordered, args.uniform, args.readers, true, sample.commits, total_commit_time, num_commits, duration, num_queries, duration);
+				writer.write_all(data_line.as_bytes()).expect("Unable to write data");
+
+				prev_sample = sample;
+			}
+		}
+
+		let data_line = format!("{},{},{},{},{},{},{},{},{},{},{},{},{}\n", run_data_name, args.archive, args.compress, args.ordered, args.uniform, args.readers, false, args.commits, commit_elapsed, args.commits, commit_elapsed, args.commits * COMMIT_SIZE, query_elapsed);
 		writer.write_all(data_line.as_bytes()).expect("Unable to write data");
 	}
 }

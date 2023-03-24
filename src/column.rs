@@ -114,6 +114,24 @@ pub struct TablesRef<'a> {
 	pub ref_counted: bool,
 }
 
+/// Value iteration state
+pub struct ValueIterState {
+	/// Reference counter.
+	pub rc: u32,
+	/// Value.
+	pub value: Vec<u8>,
+}
+
+// Only used for DB validation and migration.
+pub struct CorruptedIndexEntryInfo {
+	pub chunk_index: u64,
+	pub sub_index: u32,
+	pub entry: crate::index::Entry,
+	pub value_entry: Option<Vec<u8>>,
+	pub error: Option<Error>,
+}
+
+// Only used for DB validation and migration.
 pub struct IterState {
 	pub chunk_index: u64,
 	pub key: Key,
@@ -121,9 +139,10 @@ pub struct IterState {
 	pub value: Vec<u8>,
 }
 
+// Only used for DB validation and migration.
 enum IterStateOrCorrupted {
 	Item(IterState),
-	Corrupted(crate::index::Entry, Option<Error>),
+	Corrupted(CorruptedIndexEntryInfo),
 }
 
 #[inline]
@@ -137,12 +156,30 @@ pub fn hash_key(key: &[u8], salt: &Salt, uniform: bool, db_version: u32) -> Key 
 	if uniform {
 		if db_version <= 5 {
 			k.copy_from_slice(&key[0..32]);
-		} else {
-			// For keys that are hashes already we do a simple XOR with salt.
+		} else if db_version <= 7 {
+			// XOR with salt.
 			let key = &key[0..32];
 			for i in 0..32 {
 				k[i] = key[i] ^ salt[i];
 			}
+		} else {
+			#[cfg(any(test, feature = "instrumentation"))]
+			// Used for forcing collisions in tests.
+			if salt == &Salt::default() {
+				k.copy_from_slice(&key);
+				return k
+			}
+			// siphash 1-3 first 128 bits of the key
+			use siphasher::sip128::Hasher128;
+			use std::hash::Hasher;
+			let mut hasher = siphasher::sip128::SipHasher13::new_with_key(
+				salt[..16].try_into().expect("Salt length is 32"),
+			);
+			hasher.write(&key);
+			let hash = hasher.finish128();
+			k[0..8].copy_from_slice(&hash.h1.to_le_bytes());
+			k[8..16].copy_from_slice(&hash.h2.to_le_bytes());
+			k[16..].copy_from_slice(&key[16..]);
 		}
 	} else {
 		let mut ctx = Blake2bMac::<U32>::new_with_salt_and_personal(salt, &[], &[])
@@ -425,7 +462,7 @@ impl HashColumn {
 		while let PlanOutcome::NeedReindex =
 			tables.index.write_insert_plan(key, address, None, log)?
 		{
-			log::info!(target: "parity-db", "{}: Index chunk full {} when reindexing", tables.index.id, hex(key));
+			log::debug!(target: "parity-db", "{}: Index chunk full {} when reindexing", tables.index.id, hex(key));
 			(tables, reindex) = Self::trigger_reindex(tables, reindex, self.path.as_path());
 			outcome = PlanOutcome::NeedReindex;
 		}
@@ -706,87 +743,88 @@ impl HashColumn {
 		tables.index.write_stats(&self.stats)
 	}
 
-	pub fn iter_while(&self, log: &Log, mut f: impl FnMut(IterState) -> bool) -> Result<()> {
+	pub fn iter_values(&self, log: &Log, mut f: impl FnMut(ValueIterState) -> bool) -> Result<()> {
+		let tables = self.tables.read();
+		for table in &tables.value {
+			log::debug!( target: "parity-db", "{}: Iterating table {}", tables.index.id, table.id);
+			table.iter_while(log.overlays(), |_, rc, value, compressed| {
+				let value = if compressed {
+					if let Ok(value) = self.compression.decompress(&value) {
+						value
+					} else {
+						return false
+					}
+				} else {
+					value
+				};
+				let state = ValueIterState { rc, value };
+				f(state)
+			})?;
+			log::debug!( target: "parity-db", "{}: Done iterating table {}", tables.index.id, table.id);
+		}
+		Ok(())
+	}
+
+	pub fn iter_index(&self, log: &Log, mut f: impl FnMut(IterState) -> bool) -> Result<()> {
 		let action = |state| match state {
 			IterStateOrCorrupted::Item(item) => Ok(f(item)),
 			IterStateOrCorrupted::Corrupted(..) =>
 				Err(Error::Corruption("Missing indexed value".into())),
 		};
-		self.iter_while_inner(log, action, 0, true)
+		self.iter_index_internal(log, action, 0)
 	}
 
-	fn iter_while_inner(
+	fn iter_index_internal(
 		&self,
 		log: &Log,
 		mut f: impl FnMut(IterStateOrCorrupted) -> Result<bool>,
 		start_chunk: u64,
-		skip_preimage_indexes: bool,
 	) -> Result<()> {
-		use blake2::{digest::typenum::U32, Blake2b, Digest};
-
 		let tables = self.tables.read();
 		let source = &tables.index;
 
-		if skip_preimage_indexes && self.preimage {
-			// It is much faster to iterate over the value table than index.
-			// We have to assume hashing scheme however.
-			for table in &tables.value[..tables.value.len() - 1] {
-				log::debug!( target: "parity-db", "{}: Iterating table {}", source.id, table.id);
-				table.iter_while(log.overlays(), |index, rc, value, compressed| {
-					let value = if compressed {
-						if let Ok(value) = self.compression.decompress(&value) {
-							value
-						} else {
-							return false
-						}
-					} else {
-						value
-					};
-					let key = Blake2b::<U32>::digest(&value);
-					let key = self.hash_key(&key);
-					let state = IterStateOrCorrupted::Item(IterState {
-						chunk_index: index,
-						key,
-						rc,
-						value,
-					});
-					f(state).unwrap_or(false)
-				})?;
-				log::debug!( target: "parity-db", "{}: Done iterating table {}", source.id, table.id);
-			}
-		}
-
 		for c in start_chunk..source.id.total_chunks() {
 			let entries = source.entries(c, log.overlays())?;
-			for entry in entries.iter() {
+			for (sub_index, entry) in entries.iter().enumerate() {
 				if entry.is_empty() {
 					continue
 				}
-				let (size_tier, offset) = if self.db_version >= 4 {
+				let (size_tier, offset) = {
 					let address = entry.address(source.id.index_bits());
 					(address.size_tier(), address.offset())
-				} else {
-					let addr_bits = source.id.index_bits() + 10;
-					let address = Address::from_u64(entry.as_u64() & ((1u64 << addr_bits) - 1));
-					let size_tier = (address.as_u64() & 0x0f) as u8;
-					let offset = address.as_u64() >> 4;
-					(size_tier, offset)
 				};
 
-				if skip_preimage_indexes &&
-					self.preimage && size_tier as usize != tables.value.len() - 1
-				{
-					continue
-				}
 				let value = tables.value[size_tier as usize].get_with_meta(offset, log.overlays());
 				let (value, rc, pk, compressed) = match value {
 					Ok(Some(v)) => v,
 					Ok(None) => {
-						f(IterStateOrCorrupted::Corrupted(*entry, None))?;
+						let value_entry = tables.value[size_tier as usize].dump_entry(offset).ok();
+						if !f(IterStateOrCorrupted::Corrupted(CorruptedIndexEntryInfo {
+							chunk_index: c,
+							sub_index: sub_index as u32,
+							value_entry,
+							entry: *entry,
+							error: None,
+						}))? {
+							return Ok(())
+						}
 						continue
 					},
 					Err(e) => {
-						f(IterStateOrCorrupted::Corrupted(*entry, Some(e)))?;
+						let value_entry = if let Error::Corruption(_) = &e {
+							tables.value[size_tier as usize].dump_entry(offset).ok()
+						} else {
+							None
+						};
+						if !f(IterStateOrCorrupted::Corrupted(CorruptedIndexEntryInfo {
+							chunk_index: c,
+							sub_index: sub_index as u32,
+							value_entry,
+							entry: *entry,
+							error: Some(e),
+						}))? {
+							return Ok(())
+						}
 						continue
 					},
 				};
@@ -816,19 +854,22 @@ impl HashColumn {
 		let start_chunk = check_param.from.unwrap_or(0);
 		let end_chunk = check_param.bound;
 
-		let step = 1000;
+		let step = 10000;
+		let mut next_info_chunk = step;
 		let start_time = std::time::Instant::now();
-		log::info!(target: "parity-db", "Starting full index iteration at {:?}", start_time);
-		log::info!(target: "parity-db", "for {} chunks of column {}", self.tables.read().index.id.total_chunks(), col);
-		self.iter_while_inner(
+		let total_chunks = self.tables.read().index.id.total_chunks();
+		let index_id = self.tables.read().index.id;
+		log::info!(target: "parity-db", "Column {} (hash): Starting index validation", col);
+		self.iter_index_internal(
 			log,
 			|state| match state {
 				IterStateOrCorrupted::Item(IterState { chunk_index, key, rc, value }) => {
 					if Some(chunk_index) == end_chunk {
 						return Ok(false)
 					}
-					if chunk_index % step == 0 {
-						log::info!(target: "parity-db", "Chunk iteration at {}", chunk_index);
+					if chunk_index >= next_info_chunk {
+						next_info_chunk += step;
+						log::info!(target: "parity-db", "Validated {} / {} chunks", chunk_index, total_chunks);
 					}
 
 					match check_param.display {
@@ -853,16 +894,25 @@ impl HashColumn {
 					}
 					Ok(true)
 				},
-				IterStateOrCorrupted::Corrupted(entry, e) => {
-					log::info!("Corrupted value for index entry: {}:\n\t{:?}", entry.as_u64(), e);
+				IterStateOrCorrupted::Corrupted(c) => {
+					log::error!(
+						"Corrupted value for index entry: [{}][{}]: {} ({:?}). Error: {:?}",
+						c.chunk_index,
+						c.sub_index,
+						c.entry.address(index_id.index_bits()),
+						hex(&c.entry.as_u64().to_le_bytes()),
+						c.error,
+					);
+					if let Some(v) = c.value_entry {
+						log::error!("Value entry: {:?}", hex(v.as_slice()));
+					}
 					Ok(true)
 				},
 			},
 			start_chunk,
-			false,
 		)?;
 
-		log::info!(target: "parity-db", "Ended full index check, elapsed {:?}", start_time.elapsed());
+		log::info!(target: "parity-db", "Index validation complete successfully, elapsed {:?}", start_time.elapsed());
 		Ok(())
 	}
 
