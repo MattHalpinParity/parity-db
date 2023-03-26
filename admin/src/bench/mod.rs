@@ -519,7 +519,7 @@ pub fn run_internal(args: Args, db: Db) {
 		let mut writer = std::io::BufWriter::new(file);
 
 		if empty {
-			writer.write_all("Name, Archive, Compress, Ordered, Uniform, Readers, Progressive, Total Commits, Total Commit Time, Num Commits, Commit Time, Num Queries, Query Time\n".as_bytes()).expect("Unable to write data");
+			writer.write_all("Name, Archive, Compress, Ordered, Uniform, Readers, Writers, Writer Commits Per Sleep, Writer Sleep Time, Commits Per Timing Sample, Progressive, Total Commits, Total Commit Time, Num Commits, Commit Time, Num Queries, Query Time\n".as_bytes()).expect("Unable to write data");
 		}
 
 		let timing_samples = timing_samples.lock().unwrap();
@@ -532,14 +532,14 @@ pub fn run_internal(args: Args, db: Db) {
 
 				let total_commit_time = (sample.instant - commit_start).as_secs_f64();
 
-				let data_line = format!("{},{},{},{},{},{},{},{},{},{},{},{},{}\n", run_data_name, args.archive, args.compress, args.ordered, args.uniform, args.readers, true, sample.commits, total_commit_time, num_commits, duration, num_queries, duration);
+				let data_line = format!("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n", run_data_name, args.archive, args.compress, args.ordered, args.uniform, args.readers, args.writers, args.writer_commits_per_sleep, args.writer_sleep_time, args.commits_per_timing_sample, true, sample.commits, total_commit_time, num_commits, duration, num_queries, duration);
 				writer.write_all(data_line.as_bytes()).expect("Unable to write data");
 
 				prev_sample = sample;
 			}
 		}
 
-		let data_line = format!("{},{},{},{},{},{},{},{},{},{},{},{},{}\n", run_data_name, args.archive, args.compress, args.ordered, args.uniform, args.readers, false, args.commits, commit_elapsed, args.commits, commit_elapsed, args.commits * COMMIT_SIZE, query_elapsed);
+		let data_line = format!("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n", run_data_name, args.archive, args.compress, args.ordered, args.uniform, args.readers, args.writers, args.writer_commits_per_sleep, args.writer_sleep_time, args.commits_per_timing_sample, false, args.commits, commit_elapsed, args.commits, commit_elapsed, args.commits * COMMIT_SIZE, query_elapsed);
 		writer.write_all(data_line.as_bytes()).expect("Unable to write data");
 	}
 }
