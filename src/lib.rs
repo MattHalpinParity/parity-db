@@ -4,6 +4,7 @@
 #![cfg_attr(feature = "bench", feature(test))]
 
 mod btree;
+mod multitree;
 mod column;
 mod compress;
 mod db;

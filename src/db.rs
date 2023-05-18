@@ -259,6 +259,9 @@ impl DbInner {
 				let log = self.log.overlays().read();
 				column.with_locked(|btree| BTreeTable::get(key, &*log, btree))
 			},
+			Column::MultiTree(_) => {
+				Err(Error::InvalidConfiguration("MultiTree columns do not support get.".to_string()))
+			},
 		}
 	}
 
@@ -284,12 +287,15 @@ impl DbInner {
 				let l = column.with_locked(|btree| BTreeTable::get(key, &*log, btree))?;
 				Ok(l.map(|v| v.len() as u32))
 			},
+			Column::MultiTree(_) => {
+				Err(Error::InvalidConfiguration("MultiTree columns do not support get_size.".to_string()))
+			},
 		}
 	}
 
 	fn btree_iter(&self, col: ColId) -> Result<BTreeIterator> {
 		match &self.columns[col as usize] {
-			Column::Hash(_column) =>
+			Column::Hash(_) | Column::MultiTree(_) =>
 				Err(Error::InvalidConfiguration("Not an indexed column.".to_string())),
 			Column::Tree(column) => {
 				let log = self.log.overlays();
@@ -458,7 +464,7 @@ impl DbInner {
 
 			for (c, btree) in commit.changeset.btree_indexed.iter_mut() {
 				match &self.columns[*c as usize] {
-					Column::Hash(_column) =>
+					Column::Hash(_) | Column::MultiTree(_) =>
 						return Err(Error::InvalidConfiguration(
 							"Not an indexed column.".to_string(),
 						)),
@@ -678,6 +684,11 @@ impl DbInner {
 									// Check if there's another reindex on the next iteration
 									self.start_reindex(reader.record_id());
 								},
+								Column::MultiTree(col) => {
+									col.drop_index(id)?;
+									// Check if there's another reindex on the next iteration
+									self.start_reindex(reader.record_id());
+								},
 								Column::Tree(_) => (),
 							}
 						},
@@ -874,6 +885,7 @@ impl DbInner {
 		match &self.columns[c as usize] {
 			Column::Hash(column) => column.iter_values(&self.log, f),
 			Column::Tree(_) => unimplemented!(),
+			Column::MultiTree(_) => unimplemented!(),
 		}
 	}
 
@@ -881,6 +893,7 @@ impl DbInner {
 		match &self.columns[c as usize] {
 			Column::Hash(column) => column.iter_index(&self.log, f),
 			Column::Tree(_) => unimplemented!(),
+			Column::MultiTree(_) => unimplemented!(),
 		}
 	}
 }
@@ -1477,15 +1490,16 @@ impl IndexedChangeSet {
 		ops: &mut u64,
 		reindex: &mut bool,
 	) -> Result<()> {
-		let column = match column {
-			Column::Hash(column) => column,
-			Column::Tree(_) => {
-				log::warn!(target: "parity-db", "Skipping unindex commit in indexed column");
-				return Ok(())
-			},
-		};
+		if let Column::Tree(_) = column {
+			log::warn!(target: "parity-db", "Skipping unindex commit in indexed column");
+			return Ok(())
+		}
 		for change in self.changes.iter() {
-			if let PlanOutcome::NeedReindex = column.write_plan(change, writer)? {
+			if let PlanOutcome::NeedReindex = match column {
+				Column::Hash(column) => column.write_plan(change, writer)?,
+				Column::MultiTree(column) => column.write_plan(change, writer)?,
+				Column::Tree(_) => PlanOutcome::Skipped,
+			} {
 				// Reindex has triggered another reindex.
 				*reindex = true;
 			}

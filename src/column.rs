@@ -3,6 +3,7 @@
 
 use crate::{
 	btree::BTreeTable,
+	multitree::MultiTreeColumn,
 	compress::Compress,
 	db::{check::CheckDisplay, Operation, RcValue},
 	display::hex,
@@ -88,6 +89,7 @@ struct Reindex {
 pub enum Column {
 	Hash(HashColumn),
 	Tree(BTreeTable),
+	MultiTree(MultiTreeColumn),
 }
 
 #[derive(Debug)]
@@ -318,7 +320,9 @@ impl Column {
 			.map(|i| Self::open_table(arc_path.clone(), col, i as u8, column_options, db_version))
 			.collect::<Result<_>>()?;
 
-		if column_options.btree_index {
+		if column_options.multitree {
+			Ok(Column::MultiTree(MultiTreeColumn::open(col, value, options, metadata)?))
+		} else if column_options.btree_index {
 			Ok(Column::Tree(BTreeTable::open(col, value, options, metadata)?))
 		} else {
 			Ok(Column::Hash(HashColumn::open(col, value, options, metadata)?))
@@ -1233,6 +1237,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => column.complete_plan(log),
 			Column::Tree(column) => column.complete_plan(log),
+			Column::MultiTree(column) => column.complete_plan(log),
 		}
 	}
 
@@ -1240,6 +1245,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => column.validate_plan(action, log),
 			Column::Tree(column) => column.validate_plan(action, log),
+			Column::MultiTree(column) => column.validate_plan(action, log),
 		}
 	}
 
@@ -1247,6 +1253,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => column.enact_plan(action, log),
 			Column::Tree(column) => column.enact_plan(action, log),
+			Column::MultiTree(column) => column.enact_plan(action, log),
 		}
 	}
 
@@ -1254,6 +1261,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => column.flush(),
 			Column::Tree(column) => column.flush(),
+			Column::MultiTree(column) => column.flush(),
 		}
 	}
 
@@ -1261,6 +1269,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => column.refresh_metadata(),
 			Column::Tree(column) => column.refresh_metadata(),
+			Column::MultiTree(column) => column.refresh_metadata(),
 		}
 	}
 
@@ -1268,6 +1277,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => column.write_stats_text(writer),
 			Column::Tree(_column) => Ok(()),
+			Column::MultiTree(_column) => Ok(()),
 		}
 	}
 
@@ -1275,6 +1285,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => column.clear_stats(),
 			Column::Tree(_column) => Ok(()),
+			Column::MultiTree(_column) => Ok(()),
 		}
 	}
 
@@ -1282,6 +1293,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => Some(column.stat_summary()),
 			Column::Tree(_column) => None,
+			Column::MultiTree(_column) => None,
 		}
 	}
 
@@ -1289,6 +1301,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => column.dump(log, check_params, col),
 			Column::Tree(_column) => Ok(()),
+			Column::MultiTree(_column) => Ok(()),
 		}
 	}
 
@@ -1298,6 +1311,7 @@ impl Column {
 		match self {
 			Column::Hash(column) => Some(column.tables.read().index.id.index_bits()),
 			Column::Tree(_column) => None,
+			Column::MultiTree(_column) => None,
 		}
 	}
 }
