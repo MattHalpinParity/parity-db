@@ -5,6 +5,7 @@ use super::*;
 
 mod data;
 
+use parity_db::{Operation, NewNode};
 pub use parity_db::{CompressionType, Db, Key, Value};
 
 use rand::{RngCore, SeedableRng};
@@ -105,13 +106,19 @@ fn writer(
 	shutdown: Arc<AtomicBool>,
 	start_commit: usize,
 ) {
+	let mut commit = Vec::new();
+
 	loop {
 		let n = NEXT_COMMIT.fetch_add(1, Ordering::SeqCst);
 		if n >= start_commit + args.commits || shutdown.load(Ordering::Relaxed) {
 			break
 		}
 
+		commit.push(Operation::InsertTree(vec![3u8,6,2,7,4,34,7,8,], NewNode { data: vec![57u8,1,7,8,34,5], children: Vec::new() }));
+
+		db.commit_changes(commit);
 		COMMITS.fetch_add(1, Ordering::Relaxed);
+		commit.clear();
 	}
 }
 

@@ -2,7 +2,7 @@
 // This file is dual-licensed as Apache-2.0 or MIT.
 
 use crate::{
-	column::{ColId, Column, TablesRef},
+	column::{hash_key, ColId, Column, TablesRef},
 	compress::Compress,
 	db::{RcValue},
 	error::{Error, Result},
@@ -28,6 +28,21 @@ use std::{
 };
 
 const MIN_INDEX_BITS: u8 = 16;
+
+pub type NodeAddress = u64;
+pub type Children = Vec<NodeAddress>;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NodeRef {
+	New(NewNode),
+	Existing(NodeAddress),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NewNode {
+	data: Vec<u8>,
+	children: Vec<NodeRef>,
+}
 
 #[derive(Debug)]
 struct Tables {
@@ -272,5 +287,162 @@ impl MultiTreeColumn {
 		}
 		log::debug!(target: "parity-db", "Dropped {}", id);
 		Ok(())
+	}
+
+	pub fn as_ref<'a>(&'a self, tables: &'a [ValueTable]) -> TablesRef<'a> {
+		TablesRef {
+			tables,
+			preimage: false,//self.preimage,
+			col: self.col,
+			ref_counted: false,//self.ref_counted,
+			compression: &self.compression,
+		}
+	}
+}
+
+pub mod commit_overlay {
+	use super::*;
+	use crate::{
+		column::{ColId, Column},
+		db::{MultiTreeCommitOverlay, Operation, RcKey, RcValue},
+		error::Result,
+	};
+
+	#[derive(Debug)]
+	pub struct MultiTreeChangeSet {
+		pub col: ColId,
+		pub changes: Vec<Operation<Key, RcValue>>,
+	}
+
+	impl MultiTreeChangeSet {
+		pub fn new(col: ColId) -> Self {
+			MultiTreeChangeSet { col, changes: Default::default() }
+		}
+
+		pub fn push(
+			&mut self, 
+			column: &Column, 
+			change: Operation<Value, Value>, 
+			options: &Options, 
+			db_version: u32,
+			log: &Log
+		) -> Result<()> {
+			match column {
+				Column::MultiTree(multitree) => {
+					match change {
+						Operation::InsertTree(key, node) => {
+							// Traverse tree acquiring table addresses for each node. Write LogWriter for this.
+							// Then a single operation to changes which is the Set of the root key to root data (which includes child NodeAddresses etc).
+
+							let mut writer = log.begin_record();
+							let tables = multitree.tables.upgradable_read();
+
+							let table_key = TableKey::NoHash;
+
+							let value = node.data.as_ref();
+
+							// Add children to value
+
+							let address = Column::write_new_value_plan(
+								&table_key,
+								multitree.as_ref(&tables.value),
+								value,
+								&mut writer,
+								None,//stats,
+							)?;
+
+							let mut outcome = PlanOutcome::Written;
+
+							multitree.complete_plan(log);
+
+							let record_id = writer.record_id();
+
+							let salt = options.salt.unwrap_or_default();
+							let hash_key = |key: &[u8]| -> Key {
+								hash_key(key, &salt, options.columns[self.col as usize].uniform, db_version)
+							};
+
+							self.changes.push(Operation::Set(hash_key(key.as_ref()), node.data.into()));
+						},
+						Operation::RemoveTree(key) => {
+							return Err(Error::InvalidInput(format!("RemoveTree not implemented yet")))
+						},
+						_ => {
+							return Err(Error::InvalidInput(format!("Invalid operation for column {}", self.col)))
+						}
+					}
+				},
+				_ => {
+					return Err(Error::InvalidInput(format!("Column is not MultiTree")))
+				}
+			}
+
+			Ok(())
+		}
+
+		pub fn copy_to_overlay(
+			&self,
+			overlay: &mut MultiTreeCommitOverlay,
+			record_id: u64,
+			bytes: &mut usize,
+			options: &Options,
+		) -> Result<()> {
+			//let ref_counted = options.columns[self.col as usize].ref_counted;
+			for change in self.changes.iter() {
+				match change {
+					/* Operation::Set(key, value) => {
+						*bytes += key.value().len();
+						*bytes += value.value().len();
+						overlay.insert(key.clone(), (record_id, Some(value.clone())));
+					},
+					Operation::Dereference(key) => {
+						// Don't add removed ref-counted values to overlay.
+						// (current ref_counted implementation does not
+						// make much sense for btree indexed content).
+						if !ref_counted {
+							*bytes += key.value().len();
+							overlay.insert(key.clone(), (record_id, None));
+						}
+					},
+					Operation::Reference(..) => {
+						// Don't add (we allow remove value in overlay when using rc: some
+						// indexing on top of it is expected).
+						if !ref_counted {
+							return Err(Error::InvalidInput(format!(
+								"No Rc for column {}",
+								self.col
+							)))
+						}
+					}, */
+					Operation::Set(..) | Operation::Dereference(..) | Operation::Reference(..) => {
+						return Err(Error::InvalidInput(format!(
+							"Operation not supported for column {}",
+							self.col
+						)))
+					},
+					Operation::InsertTree(key, node) => {
+						// Traverse tree acquiring table addresses for each node.
+						// Add this to the overlay.
+					},
+					Operation::RemoveTree(key) => {
+						return Err(Error::InvalidInput(format!("RemoveTree not implemented yet")))
+					}
+				}
+			}
+			Ok(())
+		}
+
+		pub fn clean_overlay(&mut self, overlay: &mut MultiTreeCommitOverlay, record_id: u64) {
+		}
+
+		pub fn write_plan(
+			&mut self,
+			multitree: &MultiTreeColumn,
+			writer: &mut LogWriter,
+			ops: &mut u64,
+			reindex: &mut bool,
+		) -> Result<()> {
+			Ok(())
+		}
 	}
 }

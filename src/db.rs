@@ -20,6 +20,7 @@
 
 use crate::{
 	btree::{commit_overlay::BTreeChangeSet, BTreeIterator, BTreeTable},
+	multitree::{commit_overlay::MultiTreeChangeSet, NewNode, Children},
 	column::{hash_key, ColId, Column, IterState, ReindexBatch, ValueIterState},
 	error::{try_io, Error, Result},
 	hash::IdentityBuildHasher,
@@ -28,7 +29,7 @@ use crate::{
 	options::{Options, CURRENT_VERSION},
 	parking_lot::{Condvar, Mutex, RwLock},
 	stats::StatSummary,
-	ColumnOptions, Key,
+	ColumnOptions, Key, NodeAddress,
 };
 use fs2::FileExt;
 use std::{
@@ -304,6 +305,28 @@ impl DbInner {
 		}
 	}
 
+	fn get_root(&self, col: ColId, key: Key) -> Result<Option<(Vec<u8>, Children)>> {
+		match &self.columns[col as usize] {
+			Column::Hash(_) | Column::Tree(_) =>
+				Err(Error::InvalidConfiguration("Not a MultiTree column.".to_string())),
+			Column::MultiTree(column) => {
+				let log = self.log.overlays();
+				Err(Error::InvalidConfiguration("Not implemented yet.".to_string())),
+			},
+		}
+	}
+
+	fn get_node(&self, col: ColId, node_address: NodeAddress) -> Result<Option<(Vec<u8>, Children)>> {
+		match &self.columns[col as usize] {
+			Column::Hash(_) | Column::Tree(_) =>
+				Err(Error::InvalidConfiguration("Not a MultiTree column.".to_string())),
+			Column::MultiTree(column) => {
+				let log = self.log.overlays();
+				Err(Error::InvalidConfiguration("Not implemented yet.".to_string())),
+			},
+		}
+	}
+
 	// Commit simply adds the data to the queue and to the overlay and
 	// exits as early as possible.
 	fn commit<I, K>(&self, tx: I) -> Result<()>
@@ -333,13 +356,21 @@ impl DbInner {
 					.btree_indexed
 					.entry(col)
 					.or_insert_with(|| BTreeChangeSet::new(col))
-					.push(change)
+					.push(change)?
+			} else if self.options.columns[col as usize].multitree {
+				commit.multitree_indexed.entry(col).or_insert_with(|| MultiTreeChangeSet::new(col)).push(
+					&self.columns[col as usize],
+					change,
+					&self.options,
+					self.db_version,
+					&self.log,
+				)?
 			} else {
 				commit.indexed.entry(col).or_insert_with(|| IndexedChangeSet::new(col)).push(
 					change,
 					&self.options,
 					self.db_version,
-				)
+				)?
 			}
 		}
 
@@ -383,6 +414,15 @@ impl DbInner {
 		for (c, iterset) in &commit.btree_indexed {
 			iterset.copy_to_overlay(
 				&mut overlay[*c as usize].btree_indexed,
+				record_id,
+				&mut bytes,
+				&self.options,
+			)?;
+		}
+
+		for (c, set) in &commit.multitree_indexed {
+			set.copy_to_overlay(
+				&mut overlay[*c as usize].multitree_indexed,
 				record_id,
 				&mut bytes,
 				&self.options,
@@ -474,6 +514,18 @@ impl DbInner {
 				}
 			}
 
+			for (c, multitree) in commit.changeset.multitree_indexed.iter_mut() {
+				match &self.columns[*c as usize] {
+					Column::Hash(_) | Column::Tree(_) =>
+						return Err(Error::InvalidConfiguration(
+							"Not a multitree column.".to_string(),
+						)),
+					Column::MultiTree(column) => {
+						multitree.write_plan(column, &mut writer, &mut ops, &mut reindex)?;
+					},
+				}
+			}
+
 			// Collect final changes to value tables
 			for c in self.columns.iter() {
 				c.complete_plan(&mut writer)?;
@@ -497,6 +549,9 @@ impl DbInner {
 				}
 				for (c, iterset) in commit.changeset.btree_indexed.iter_mut() {
 					iterset.clean_overlay(&mut overlay[*c as usize].btree_indexed, commit.id);
+				}
+				for (c, multitree) in commit.changeset.multitree_indexed.iter_mut() {
+					multitree.clean_overlay(&mut overlay[*c as usize].multitree_indexed, commit.id);
 				}
 			}
 
@@ -1004,6 +1059,14 @@ impl Db {
 		self.inner.btree_iter(col)
 	}
 
+	pub fn get_root(&self, col: ColId, key: Key) -> Result<Option<(Vec<u8>, Children)>> {
+		self.inner.get_root(col, key)
+	}
+
+	pub fn get_node(&self, col: ColId, node_address: NodeAddress) -> Result<Option<(Vec<u8>, Children)>> {
+		self.inner.get_node(col, node_address)
+	}
+
 	/// Commit a set of changes to the database.
 	pub fn commit<I, K>(&self, tx: I) -> Result<()>
 	where
@@ -1269,21 +1332,23 @@ impl Db {
 
 pub type IndexedCommitOverlay = HashMap<Key, (u64, Option<RcValue>), IdentityBuildHasher>;
 pub type BTreeCommitOverlay = BTreeMap<RcValue, (u64, Option<RcValue>)>;
+pub type MultiTreeCommitOverlay = (HashMap<Key, (u64, Option<RcValue>), IdentityBuildHasher>, HashMap<u64, (u64, RcValue)>);
 
 #[derive(Debug)]
 pub struct CommitOverlay {
 	indexed: IndexedCommitOverlay,
 	btree_indexed: BTreeCommitOverlay,
+	multitree_indexed: MultiTreeCommitOverlay,
 }
 
 impl CommitOverlay {
 	fn new() -> Self {
-		CommitOverlay { indexed: Default::default(), btree_indexed: Default::default() }
+		CommitOverlay { indexed: Default::default(), btree_indexed: Default::default(), multitree_indexed: Default::default() }
 	}
 
 	#[cfg(test)]
 	fn is_empty(&self) -> bool {
-		self.indexed.is_empty() && self.btree_indexed.is_empty()
+		self.indexed.is_empty() && self.btree_indexed.is_empty() && self.multitree_indexed.0.is_empty() && self.multitree_indexed.1.is_empty()
 	}
 }
 
@@ -1356,6 +1421,14 @@ impl CommitOverlay {
 				.map(|(k, (_, v))| (k.clone(), v.clone())),
 		}
 	}
+
+	pub fn multitree_get_root(&self, key: &[u8]) -> Option<Option<&RcValue>> {
+		self.multitree_indexed.0.get(key).map(|(_, v)| v.as_ref())
+	}
+
+	pub fn multitree_get_node(&self, node_address: u64) -> Option<&RcValue> {
+		self.multitree_indexed.1.get(&node_address).map(|(_, v)| v)
+	}
 }
 
 /// Different operations allowed for a commit.
@@ -1373,6 +1446,12 @@ pub enum Operation<Key, Value> {
 	/// Increment the reference count counter of an existing value for a given key.
 	/// If no value exists for the key, this operation is skipped.
 	Reference(Key),
+
+	/// Insert a new tree into a MultiTree column using root key and node structure.
+	InsertTree(Key, NewNode),
+
+	/// Remove an existing tree (at root Key) from a MultiTree column.
+	RemoveTree(Key),
 }
 
 impl<Key: Ord, Value: Eq> PartialOrd<Self> for Operation<Key, Value> {
@@ -1415,6 +1494,7 @@ impl<K: AsRef<[u8]>, Value> Operation<K, Value> {
 pub struct CommitChangeSet {
 	pub indexed: HashMap<ColId, IndexedChangeSet>,
 	pub btree_indexed: HashMap<ColId, BTreeChangeSet>,
+	pub multitree_indexed: HashMap<ColId, MultiTreeChangeSet>,
 }
 
 #[derive(Debug)]
@@ -1433,7 +1513,7 @@ impl IndexedChangeSet {
 		change: Operation<K, Vec<u8>>,
 		options: &Options,
 		db_version: u32,
-	) {
+	) -> Result<()> {
 		let salt = options.salt.unwrap_or_default();
 		let hash_key = |key: &[u8]| -> Key {
 			hash_key(key, &salt, options.columns[self.col as usize].uniform, db_version)
@@ -1443,7 +1523,12 @@ impl IndexedChangeSet {
 			Operation::Set(k, v) => Operation::Set(hash_key(k.as_ref()), v.into()),
 			Operation::Dereference(k) => Operation::Dereference(hash_key(k.as_ref())),
 			Operation::Reference(k) => Operation::Reference(hash_key(k.as_ref())),
-		})
+			Operation::InsertTree(..) | Operation::RemoveTree(..) => {
+				return Err(Error::InvalidInput(format!("Invalid operation for column {}", self.col)))
+			},
+		});
+
+		Ok(())
 	}
 
 	fn push_change_hashed(&mut self, change: Operation<Key, RcValue>) {
@@ -1490,16 +1575,19 @@ impl IndexedChangeSet {
 		ops: &mut u64,
 		reindex: &mut bool,
 	) -> Result<()> {
-		if let Column::Tree(_) = column {
-			log::warn!(target: "parity-db", "Skipping unindex commit in indexed column");
-			return Ok(())
-		}
+		let column = match column {
+			Column::Hash(column) => column,
+			Column::Tree(_) => {
+				log::warn!(target: "parity-db", "Skipping unindex commit in indexed column");
+				return Ok(())
+			},
+			Column::MultiTree(_) => {
+				log::warn!(target: "parity-db", "Skipping commit in multitree column");
+				return Ok(())
+			},
+		};
 		for change in self.changes.iter() {
-			if let PlanOutcome::NeedReindex = match column {
-				Column::Hash(column) => column.write_plan(change, writer)?,
-				Column::MultiTree(column) => column.write_plan(change, writer)?,
-				Column::Tree(_) => PlanOutcome::Skipped,
-			} {
+			if let PlanOutcome::NeedReindex = column.write_plan(change, writer)? {
 				// Reindex has triggered another reindex.
 				*reindex = true;
 			}
@@ -1519,7 +1607,7 @@ impl IndexedChangeSet {
 						}
 					}
 				},
-				Operation::Reference(..) => (),
+				Operation::Reference(..) | Operation::InsertTree(..) | Operation::RemoveTree(..) => (),
 			}
 		}
 	}
