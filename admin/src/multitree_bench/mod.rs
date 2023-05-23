@@ -114,9 +114,9 @@ fn writer(
 			break
 		}
 
-		commit.push(Operation::InsertTree(vec![3u8,6,2,7,4,34,7,8,], NewNode { data: vec![57u8,1,7,8,34,5], children: Vec::new() }));
+		commit.push((0, Operation::InsertTree(vec![3u8,6,2,7,4,34,7,8,], NewNode { data: vec![57u8,1,7,8,34,5], children: Vec::new() })));
 
-		db.commit_changes(commit);
+		db.commit_changes(commit.drain(..)).unwrap();
 		COMMITS.fetch_add(1, Ordering::Relaxed);
 		commit.clear();
 	}

@@ -5,6 +5,7 @@ use crate::{
 	column::{hash_key, ColId, Column, TablesRef},
 	compress::Compress,
 	db::{RcValue},
+	display::hex,
 	error::{Error, Result},
 	options::{Metadata, Options, DEFAULT_COMPRESSION_THRESHOLD},
 	parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard},
@@ -40,8 +41,8 @@ pub enum NodeRef {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct NewNode {
-	data: Vec<u8>,
-	children: Vec<NodeRef>,
+	pub data: Vec<u8>,
+	pub children: Vec<NodeRef>,
 }
 
 #[derive(Debug)]
@@ -160,35 +161,55 @@ impl MultiTreeColumn {
 		change: &Operation<Key, RcValue>,
 		log: &mut LogWriter,
 	) -> Result<PlanOutcome> {
-		/* let tables = self.tables.upgradable_read();
+		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
-		let existing = Self::search_all_indexes(change.key(), &tables, &reindex, log)?;
+		/* let existing = Self::search_all_indexes(change.key(), &tables, &reindex, log)?;
 		if let Some((table, sub_index, existing_address)) = existing {
 			self.write_plan_existing(&tables, change, log, table, sub_index, existing_address)
-		} else {
+		} else */ {
 			match change {
 				Operation::Set(key, value) => {
 					let (r, _, _) =
 						self.write_plan_new(tables, reindex, key, value.as_ref(), log)?;
 					Ok(r)
 				},
-				Operation::Dereference(key) => {
-					log::trace!(target: "parity-db", "{}: Deleting missing key {}", tables.index.id, hex(key));
-					if self.collect_stats {
-						self.stats.remove_miss();
-					}
-					Ok(PlanOutcome::Skipped)
-				},
-				Operation::Reference(key) => {
-					log::trace!(target: "parity-db", "{}: Ignoring increase rc, missing key {}", tables.index.id, hex(key));
-					if self.collect_stats {
-						self.stats.reference_increase_miss();
-					}
+				_ => {
 					Ok(PlanOutcome::Skipped)
 				},
 			}
-		} */
-		Ok(PlanOutcome::Skipped)
+		}
+	}
+
+	fn write_plan_new<'a, 'b>(
+		&self,
+		mut tables: RwLockUpgradableReadGuard<'a, Tables>,
+		mut reindex: RwLockUpgradableReadGuard<'b, Reindex>,
+		key: &Key,
+		value: &[u8],
+		log: &mut LogWriter,
+	) -> Result<(
+		PlanOutcome,
+		RwLockUpgradableReadGuard<'a, Tables>,
+		RwLockUpgradableReadGuard<'b, Reindex>,
+	)> {
+		let stats = None;//self.collect_stats.then_some(&self.stats);
+		let table_key = TableKey::Partial(*key);
+		let address = Column::write_new_value_plan(
+			&table_key,
+			self.as_ref(&tables.value),
+			value,
+			log,
+			stats,
+		)?;
+		let mut outcome = PlanOutcome::Written;
+		while let PlanOutcome::NeedReindex =
+			tables.index.write_insert_plan(key, address, None, log)?
+		{
+			log::debug!(target: "parity-db", "{}: Index chunk full {}", tables.index.id, hex(key));
+			(tables, reindex) = Self::trigger_reindex(tables, reindex, self.path.as_path());
+			outcome = PlanOutcome::NeedReindex;
+		}
+		Ok((outcome, tables, reindex))
 	}
 
 	pub fn enact_plan(&self, action: LogAction, log: &mut LogReader) -> Result<()> {
@@ -215,6 +236,9 @@ impl MultiTreeColumn {
 			LogAction::InsertValue(record) => {
 				tables.value[record.table.size_tier() as usize].enact_plan(record.index, log)?;
 			},
+			// This should never happen, unless something has modified the log file while the
+			// database is running. Existing logs should be validated with `validate_plan` on
+			// startup.
 			_ => return Err(Error::Corruption("Unexpected log action".into())),
 		}
 		Ok(())
@@ -325,14 +349,16 @@ pub mod commit_overlay {
 			change: Operation<Value, Value>, 
 			options: &Options, 
 			db_version: u32,
-			log: &Log
+			log: &Log,
+			bytes: &mut u64,
 		) -> Result<()> {
 			match column {
 				Column::MultiTree(multitree) => {
 					match change {
 						Operation::InsertTree(key, node) => {
 							// Traverse tree acquiring table addresses for each node. Write LogWriter for this.
-							// Then a single operation to changes which is the Set of the root key to root data (which includes child NodeAddresses etc).
+							// Then add a single operation to changes which is the Set of the root key to root data (which includes child NodeAddresses etc).
+							// Don't need any Operations for child nodes or anything added to the commit overlay because they have already been added to a log record (and hence log overlay).
 
 							let mut writer = log.begin_record();
 							let tables = multitree.tables.upgradable_read();
@@ -342,7 +368,6 @@ pub mod commit_overlay {
 							let value = node.data.as_ref();
 
 							// Add children to value
-
 							let address = Column::write_new_value_plan(
 								&table_key,
 								multitree.as_ref(&tables.value),
@@ -351,11 +376,13 @@ pub mod commit_overlay {
 								None,//stats,
 							)?;
 
-							let mut outcome = PlanOutcome::Written;
+							multitree.complete_plan(&mut writer)?;
 
-							multitree.complete_plan(log);
+							//let record_id = writer.record_id();
 
-							let record_id = writer.record_id();
+							let l = writer.drain();
+
+							*bytes += log.end_record(l)?;
 
 							let salt = options.salt.unwrap_or_default();
 							let hash_key = |key: &[u8]| -> Key {
@@ -364,7 +391,7 @@ pub mod commit_overlay {
 
 							self.changes.push(Operation::Set(hash_key(key.as_ref()), node.data.into()));
 						},
-						Operation::RemoveTree(key) => {
+						Operation::RemoveTree(_key) => {
 							return Err(Error::InvalidInput(format!("RemoveTree not implemented yet")))
 						},
 						_ => {
@@ -387,42 +414,22 @@ pub mod commit_overlay {
 			bytes: &mut usize,
 			options: &Options,
 		) -> Result<()> {
-			//let ref_counted = options.columns[self.col as usize].ref_counted;
 			for change in self.changes.iter() {
 				match change {
-					/* Operation::Set(key, value) => {
-						*bytes += key.value().len();
-						*bytes += value.value().len();
-						overlay.insert(key.clone(), (record_id, Some(value.clone())));
-					},
-					Operation::Dereference(key) => {
-						// Don't add removed ref-counted values to overlay.
-						// (current ref_counted implementation does not
-						// make much sense for btree indexed content).
-						if !ref_counted {
-							*bytes += key.value().len();
-							overlay.insert(key.clone(), (record_id, None));
-						}
-					},
-					Operation::Reference(..) => {
-						// Don't add (we allow remove value in overlay when using rc: some
-						// indexing on top of it is expected).
-						if !ref_counted {
-							return Err(Error::InvalidInput(format!(
-								"No Rc for column {}",
-								self.col
-							)))
-						}
-					}, */
-					Operation::Set(..) | Operation::Dereference(..) | Operation::Reference(..) => {
+					Operation::Dereference(..) | Operation::Reference(..) => {
 						return Err(Error::InvalidInput(format!(
 							"Operation not supported for column {}",
 							self.col
 						)))
 					},
+					Operation::Set(k, v) => {
+						// Get a set operation from each InsertTree. This is for the root node.
+						*bytes += k.len();
+						*bytes += v.value().len();
+						overlay.0.insert(*k, (record_id, Some(v.clone())));
+					},
 					Operation::InsertTree(key, node) => {
-						// Traverse tree acquiring table addresses for each node.
-						// Add this to the overlay.
+						return Err(Error::InvalidInput(format!("Unexpected operation")))
 					},
 					Operation::RemoveTree(key) => {
 						return Err(Error::InvalidInput(format!("RemoveTree not implemented yet")))
@@ -433,6 +440,19 @@ pub mod commit_overlay {
 		}
 
 		pub fn clean_overlay(&mut self, overlay: &mut MultiTreeCommitOverlay, record_id: u64) {
+			use std::collections::hash_map::Entry;
+			for change in self.changes.iter() {
+				match change {
+					Operation::Set(k, _) => {
+						if let Entry::Occupied(e) = overlay.0.entry(*k) {
+							if e.get().0 == record_id {
+								e.remove_entry();
+							}
+						}
+					},
+					Operation::Reference(..) | Operation::Dereference(..) | Operation::InsertTree(..) | Operation::RemoveTree(..) => (),
+				}
+			}
 		}
 
 		pub fn write_plan(
@@ -442,6 +462,13 @@ pub mod commit_overlay {
 			ops: &mut u64,
 			reindex: &mut bool,
 		) -> Result<()> {
+			for change in self.changes.iter() {
+				if let PlanOutcome::NeedReindex = multitree.write_plan(change, writer)? {
+					// Reindex has triggered another reindex.
+					*reindex = true;
+				}
+				*ops += 1;
+			}
 			Ok(())
 		}
 	}

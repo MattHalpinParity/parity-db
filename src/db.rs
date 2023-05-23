@@ -139,6 +139,7 @@ struct DbInner {
 	log: Log,
 	commit_queue: Mutex<CommitQueue>,
 	commit_queue_full_cv: Condvar,
+	log_writer_mutex: Mutex<bool>,
 	log_worker_wait: WaitCondvar<bool>,
 	commit_worker_wait: Arc<WaitCondvar<bool>>,
 	// Overlay of most recent values in the commit queue.
@@ -223,6 +224,7 @@ impl DbInner {
 			log,
 			commit_queue: Mutex::new(Default::default()),
 			commit_queue_full_cv: Condvar::new(),
+			log_writer_mutex: Mutex::new(false),
 			log_worker_wait: WaitCondvar::new(),
 			commit_worker_wait: Arc::new(WaitCondvar::new()),
 			commit_overlay: RwLock::new(commit_overlay),
@@ -307,22 +309,24 @@ impl DbInner {
 
 	fn get_root(&self, col: ColId, key: Key) -> Result<Option<(Vec<u8>, Children)>> {
 		match &self.columns[col as usize] {
-			Column::Hash(_) | Column::Tree(_) =>
-				Err(Error::InvalidConfiguration("Not a MultiTree column.".to_string())),
+			Column::Hash(_) | Column::Tree(_) => {
+				Err(Error::InvalidConfiguration("Not a MultiTree column.".to_string()))
+			},
 			Column::MultiTree(column) => {
 				let log = self.log.overlays();
-				Err(Error::InvalidConfiguration("Not implemented yet.".to_string())),
+				Err(Error::InvalidConfiguration("Not implemented yet.".to_string()))
 			},
 		}
 	}
 
 	fn get_node(&self, col: ColId, node_address: NodeAddress) -> Result<Option<(Vec<u8>, Children)>> {
 		match &self.columns[col as usize] {
-			Column::Hash(_) | Column::Tree(_) =>
-				Err(Error::InvalidConfiguration("Not a MultiTree column.".to_string())),
+			Column::Hash(_) | Column::Tree(_) => {
+				Err(Error::InvalidConfiguration("Not a MultiTree column.".to_string()))
+			}
 			Column::MultiTree(column) => {
 				let log = self.log.overlays();
-				Err(Error::InvalidConfiguration("Not implemented yet.".to_string())),
+				Err(Error::InvalidConfiguration("Not implemented yet.".to_string()))
 			},
 		}
 	}
@@ -358,13 +362,21 @@ impl DbInner {
 					.or_insert_with(|| BTreeChangeSet::new(col))
 					.push(change)?
 			} else if self.options.columns[col as usize].multitree {
+				let log_writer = self.log_writer_mutex.lock();
+				let mut bytes = 0;
 				commit.multitree_indexed.entry(col).or_insert_with(|| MultiTreeChangeSet::new(col)).push(
 					&self.columns[col as usize],
 					change,
 					&self.options,
 					self.db_version,
 					&self.log,
-				)?
+					&mut bytes
+				)?;
+				if bytes > 0 {
+					let mut logged_bytes = self.log_queue_wait.work.lock();
+					*logged_bytes += bytes as i64;
+					self.flush_worker_wait.signal();
+				}
 			} else {
 				commit.indexed.entry(col).or_insert_with(|| IndexedChangeSet::new(col)).push(
 					change,
@@ -483,6 +495,8 @@ impl DbInner {
 		};
 
 		if let Some(mut commit) = commit {
+			let log_writer = self.log_writer_mutex.lock();
+
 			let mut reindex = false;
 			let mut writer = self.log.begin_record();
 			log::debug!(
@@ -1469,13 +1483,13 @@ impl<Key: Ord, Value: Eq> Ord for Operation<Key, Value> {
 impl<Key, Value> Operation<Key, Value> {
 	pub fn key(&self) -> &Key {
 		match self {
-			Operation::Set(k, _) | Operation::Dereference(k) | Operation::Reference(k) => k,
+			Operation::Set(k, _) | Operation::Dereference(k) | Operation::Reference(k) | Operation::InsertTree(k, _) | Operation::RemoveTree(k) => k,
 		}
 	}
 
 	pub fn into_key(self) -> Key {
 		match self {
-			Operation::Set(k, _) | Operation::Dereference(k) | Operation::Reference(k) => k,
+			Operation::Set(k, _) | Operation::Dereference(k) | Operation::Reference(k) | Operation::InsertTree(k, _) | Operation::RemoveTree(k) => k,
 		}
 	}
 }
@@ -1486,6 +1500,8 @@ impl<K: AsRef<[u8]>, Value> Operation<K, Value> {
 			Operation::Set(k, v) => Operation::Set(k.as_ref().to_vec(), v),
 			Operation::Dereference(k) => Operation::Dereference(k.as_ref().to_vec()),
 			Operation::Reference(k) => Operation::Reference(k.as_ref().to_vec()),
+			Operation::InsertTree(k, n) => Operation::InsertTree(k.as_ref().to_vec(), n),
+			Operation::RemoveTree(k) => Operation::RemoveTree(k.as_ref().to_vec()),
 		}
 	}
 }
@@ -1563,6 +1579,9 @@ impl IndexedChangeSet {
 						return Err(Error::InvalidInput(format!("No Rc for column {}", self.col)))
 					}
 				},
+				Operation::InsertTree(..) | Operation::RemoveTree(..) => {
+					return Err(Error::InvalidInput(format!("Invalid operation for column {}", self.col)))
+				}
 			}
 		}
 		Ok(())

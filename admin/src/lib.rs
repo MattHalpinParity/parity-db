@@ -138,6 +138,11 @@ pub fn run() -> Result<(), String> {
 			}
 
 			let mut db_options = options.clone();
+
+			for mut c in &mut db_options.columns {
+				c.multitree = true;
+			}
+
 			if args.compress {
 				for mut c in &mut db_options.columns {
 					c.compression = parity_db::CompressionType::Lz4;

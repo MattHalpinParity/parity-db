@@ -593,6 +593,9 @@ impl HashColumn {
 					}
 					Ok(PlanOutcome::Skipped)
 				},
+				Operation::InsertTree(..) | Operation::RemoveTree(..) => {
+					Err(Error::InvalidConfiguration("Unsupported operation on hash column".into()))
+				}
 			}
 		}
 	}
@@ -1209,6 +1212,9 @@ impl Column {
 					Ok((Some(PlanOutcome::Written), None))
 				}
 			},
+			Operation::InsertTree(..) | Operation::RemoveTree(..) => {
+				Err(Error::InvalidInput(format!("Invalid operation for column {}", tables.col)))
+			}
 		}
 	}
 

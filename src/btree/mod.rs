@@ -430,6 +430,9 @@ pub mod commit_overlay {
 							)))
 						}
 					},
+					Operation::InsertTree(..) | Operation::RemoveTree(..) => {
+						return Err(Error::InvalidInput(format!("Invalid operation for column {}", self.col)))
+					}
 				}
 			}
 			Ok(())
