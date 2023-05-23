@@ -1,7 +1,7 @@
 // Copyright 2021-2022 Parity Technologies (UK) Ltd.
 // This file is dual-licensed as Apache-2.0 or MIT.
 
-pub const DEPTH_CHILD_COUNT_HISTOGRAMS: &[(u32, [u64; 17])] = &[
+pub const DEPTH_CHILD_COUNT_HISTOGRAMS: &[(u32, [u32; 17])] = &[
 	(0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
 	(1, [0, 0, 9, 2, 2, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
 	(2, [9, 0, 11, 13, 4, 2, 3, 1, 1, 0, 1, 2, 1, 0, 0, 0, 1]),

@@ -5,11 +5,13 @@ use super::*;
 
 mod data;
 
-use parity_db::{Operation, NewNode};
+use parity_db::{Operation, NewNode, NodeRef};
 pub use parity_db::{CompressionType, Db, Key, Value};
 
 use rand::{RngCore, SeedableRng};
+use core::num;
 use std::{
+	collections::BTreeMap,
 	sync::{
 		atomic::{AtomicBool, AtomicUsize, Ordering},
 		Arc,
@@ -94,18 +96,137 @@ impl MultiTreeStress {
 	}
 }
 
+fn sample_histogram(rnd: u64, histogram: &BTreeMap<u32, u32>, total: u32) -> u32 {
+	let sr = (rnd % total as u64) as u32;
+	let mut range = histogram
+		.range((std::ops::Bound::Included(sr), std::ops::Bound::Unbounded));
+	let size = *range.next().unwrap().1;
+	size
+}
+
+struct ChainGenerator {
+	depth_child_count_distribution: Vec<BTreeMap<u32, u32>>,
+	depth_child_count_total: Vec<u32>,
+	value_length_distribution: BTreeMap<u32, u32>,
+	value_length_total: u32,
+}
+
+impl ChainGenerator {
+	fn new(depth_child_count_histogram: &[(u32, [u32; 17])], value_length_histogram: &[(u32, u32)]) -> ChainGenerator {
+		let mut depth_child_count_distribution = Vec::default();
+		let mut depth_child_count_total = Vec::default();
+		for (depth, histogram) in depth_child_count_histogram {
+			assert_eq!(*depth, depth_child_count_distribution.len() as u32);
+
+			let mut distribution = BTreeMap::default();
+			let mut total = 0;
+			for i in 0..histogram.len() {
+				let size = i as u32;
+				let count = histogram[i];
+				total += count;
+				if count > 0 {
+					distribution.insert(total, size);
+				}
+			}
+
+			depth_child_count_distribution.push(distribution);
+			depth_child_count_total.push(total);
+		}
+
+		let mut value_length_distribution = BTreeMap::default();
+		let mut value_length_total = 0;
+		for (size, count) in value_length_histogram {
+			value_length_total += count;
+			if *count > 0 {
+				value_length_distribution.insert(value_length_total, *size);
+			}
+		}
+
+		ChainGenerator { 
+			depth_child_count_distribution, 
+			depth_child_count_total, 
+			value_length_distribution, 
+			value_length_total,
+		}
+	}
+
+	fn key(&self, seed: u64) -> Key {
+		let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+		let mut key = Key::default();
+		rng.fill_bytes(&mut key);
+		key
+	}
+
+	/// Returns tuple of node data and child seeds
+	fn generate_node(&self, seed: u64, depth: u32) -> (Vec<u8>, Vec<u64>) {
+		let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+
+		let num_children = if depth < self.depth_child_count_distribution.len() as u32 {
+			sample_histogram(rng.next_u64(), &self.depth_child_count_distribution[depth as usize], self.depth_child_count_total[depth as usize])
+		} else {
+			0
+		};
+		let mut children_seeds = Vec::default();
+		for i in 0..num_children {
+			children_seeds.push(rng.next_u64());
+		}
+
+		let mut size = 4;
+		if num_children == 0 {
+			size = sample_histogram(rng.next_u64(), &self.value_length_distribution, self.value_length_total) as usize;
+		}
+		let mut v = Vec::new();
+		v.resize(size, 0);
+		let fill = size;
+		rng.fill_bytes(&mut v[..fill]);
+
+		(v, children_seeds)
+	}
+}
+
 fn informant(shutdown: Arc<AtomicBool>) {
 	while !shutdown.load(Ordering::Relaxed) {
 		thread::sleep(std::time::Duration::from_secs(1));
 	}
 }
 
+fn build_commit_tree(node_data: (Vec<u8>, Vec<u64>), depth: u32, chain_generator: &ChainGenerator) -> NodeRef {
+	let mut children = Vec::default();
+	for seed in node_data.1 {
+		let child_data = chain_generator.generate_node(seed, depth + 1);
+		let child_node = build_commit_tree(child_data, depth + 1, chain_generator);
+		children.push(child_node);
+	}
+	let new_node = NewNode {
+		data: node_data.0,
+		children: children,
+	};
+	NodeRef::New(new_node)
+}
+
+fn num_new_child_nodes(node: &NodeRef) -> u32 {
+	match node {
+		NodeRef::New(node) => {
+			let mut num = 0;
+			for child in &node.children {
+				num += num_new_child_nodes(child) + 1;
+			}
+			num
+		},
+		NodeRef::Existing(_) => {
+			0
+		}
+	}
+}
+
 fn writer(
 	db: Arc<Db>,
 	args: Arc<Args>,
+	chain_generator: Arc<ChainGenerator>,
 	shutdown: Arc<AtomicBool>,
 	start_commit: usize,
 ) {
+	let offset = args.seed.unwrap_or(0);
 	let mut commit = Vec::new();
 
 	loop {
@@ -114,23 +235,32 @@ fn writer(
 			break
 		}
 
-		commit.push((0, Operation::InsertTree(vec![3u8,6,2,7,4,34,7,8,], NewNode { data: vec![57u8,1,7,8,34,5], children: Vec::new() })));
+		let root_seed = n as u64 + offset;
+		let node_data = chain_generator.generate_node(root_seed, 0);
+		let root_node_ref = build_commit_tree(node_data, 0, &chain_generator);
+		let num_new_nodes = num_new_child_nodes(&root_node_ref) + 1;
+		println!("Tree commit num new nodes: {}", num_new_nodes);
+		if let NodeRef::New(node) = root_node_ref {
+			let key = chain_generator.key(root_seed);
+			commit.push((0, Operation::InsertTree(key.to_vec(), node)));
 
-		db.commit_changes(commit.drain(..)).unwrap();
-		COMMITS.fetch_add(1, Ordering::Relaxed);
-		commit.clear();
+			db.commit_changes(commit.drain(..)).unwrap();
+			COMMITS.fetch_add(1, Ordering::Relaxed);
+			commit.clear();
+		}
 	}
 }
 
 fn reader(
 	db: Arc<Db>,
 	args: Arc<Args>,
+	chain_generator: Arc<ChainGenerator>,
 	index: u64,
 	shutdown: Arc<AtomicBool>,
 ) {
 	// Query random keys while writing
-	let seed = args.seed.unwrap_or(0);
-	let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + index);
+	/* let seed = args.seed.unwrap_or(0);
+	let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + index); */
 	while !shutdown.load(Ordering::Relaxed) {
 	}
 }
@@ -149,6 +279,12 @@ pub fn run_internal(args: Args, db: Db) {
 
 	let start_commit = 0;
 
+	let total_num_expected_tree_nodes: u32 = data::DEPTH_CHILD_COUNT_HISTOGRAMS.iter().map(|x| x.1.iter().sum::<u32>()).sum();
+	println!("Total num expected tree nodes: {}", total_num_expected_tree_nodes);
+
+	let chain_generator = ChainGenerator::new(data::DEPTH_CHILD_COUNT_HISTOGRAMS, data::VALUE_LENGTH_HISTOGRAM);
+	let chain_generator = Arc::new(chain_generator);
+
 	let start_time = std::time::Instant::now();
 
 	COMMITS.store(start_commit, Ordering::SeqCst);
@@ -163,11 +299,12 @@ pub fn run_internal(args: Args, db: Db) {
 		let db = db.clone();
 		let shutdown = shutdown.clone();
 		let args = args.clone();
+		let chain_generator = chain_generator.clone();
 
 		threads.push(
 			thread::Builder::new()
 				.name(format!("reader {i}"))
-				.spawn(move || reader(db, args, i as u64, shutdown))
+				.spawn(move || reader(db, args, chain_generator, i as u64, shutdown))
 				.unwrap(),
 		);
 	}
@@ -188,11 +325,12 @@ pub fn run_internal(args: Args, db: Db) {
 		let db = db.clone();
 		let shutdown = shutdown.clone();
 		let args = args.clone();
+		let chain_generator = chain_generator.clone();
 
 		threads.push(
 			thread::Builder::new()
 				.name(format!("writer {i}"))
-				.spawn(move || writer(db, args, shutdown, start_commit))
+				.spawn(move || writer(db, args, chain_generator, shutdown, start_commit))
 				.unwrap(),
 		);
 	}
