@@ -324,6 +324,39 @@ impl MultiTreeColumn {
 	}
 }
 
+fn write_children(children: Vec<NodeRef>, tables: TablesRef, writer: &mut LogWriter) -> Result<Vec<u8>> {
+	let mut data = Vec::new();
+	for child in children {
+		let address = match child {
+			NodeRef::New(node) => {
+				write_node(node, tables, writer)?
+			},
+			NodeRef::Existing(address) => {
+				address
+			}
+		};
+		let mut data_buf = [0u8; 8];
+		data_buf.copy_from_slice(&address.to_le_bytes());
+		data.append(&mut data_buf.to_vec());
+	}
+	Ok(data)
+}
+
+fn write_node(node: NewNode, tables: TablesRef, writer: &mut LogWriter) -> Result<NodeAddress> {
+	let data = [node.data, write_children(node.children, tables, writer)?].concat();
+
+	let table_key = TableKey::NoHash;
+	let address = Column::write_new_value_plan(
+		&table_key,
+		tables,
+		data.as_ref(),
+		writer,
+		None,//stats,
+	)?;
+
+	Ok(address.as_u64())
+}
+
 pub mod commit_overlay {
 	use super::*;
 	use crate::{
@@ -363,18 +396,7 @@ pub mod commit_overlay {
 							let mut writer = log.begin_record();
 							let tables = multitree.tables.upgradable_read();
 
-							let table_key = TableKey::NoHash;
-
-							let value = node.data.as_ref();
-
-							// Add children to value
-							let address = Column::write_new_value_plan(
-								&table_key,
-								multitree.as_ref(&tables.value),
-								value,
-								&mut writer,
-								None,//stats,
-							)?;
+							let data = [node.data, write_children(node.children, multitree.as_ref(&tables.value), &mut writer)?].concat();
 
 							multitree.complete_plan(&mut writer)?;
 
@@ -389,7 +411,7 @@ pub mod commit_overlay {
 								hash_key(key, &salt, options.columns[self.col as usize].uniform, db_version)
 							};
 
-							self.changes.push(Operation::Set(hash_key(key.as_ref()), node.data.into()));
+							self.changes.push(Operation::Set(hash_key(key.as_ref()), data.into()));
 						},
 						Operation::RemoveTree(_key) => {
 							return Err(Error::InvalidInput(format!("RemoveTree not implemented yet")))
