@@ -27,7 +27,7 @@ use crate::{
 	log::{Log, LogAction},
 	multitree::{Children, NewNode, NodeAddress},
 	options::{Options, CURRENT_VERSION},
-	parking_lot::{Condvar, Mutex, RwLock, RwLockUpgradableReadGuard},
+	parking_lot::{Condvar, MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard},
 	stats::StatSummary,
 	ColumnOptions, Key,
 };
@@ -40,7 +40,7 @@ use std::{
 		atomic::{AtomicBool, AtomicU64, Ordering},
 		Arc, Weak,
 	},
-	thread,
+	thread, marker::PhantomData,
 };
 
 // Max size of commit queue. (Keys + Values). If the queue is
@@ -133,7 +133,7 @@ struct CommitQueue {
 
 #[derive(Debug)]
 struct Trees {
-	readers: HashMap<Key, Weak<TreeReader>, IdentityBuildHasher>,
+	readers: HashMap<Key, Arc<RwLock<u64>>, IdentityBuildHasher>,
 }
 
 #[derive(Debug)]
@@ -149,7 +149,8 @@ struct DbInner {
 	commit_worker_wait: Arc<WaitCondvar<bool>>,
 	// Overlay of most recent values in the commit queue.
 	commit_overlay: RwLock<Vec<CommitOverlay>>,
-	trees: RwLock<HashMap<ColId, Trees>>,
+	trees: HashMap<ColId, Trees>,
+	trees_lock: RwLock<()>,
 	// This may underflow occasionally, but is bound for 0 eventually.
 	log_queue_wait: WaitCondvar<i64>,
 	flush_worker_wait: Arc<WaitCondvar<bool>>,
@@ -160,6 +161,7 @@ struct DbInner {
 	bg_err: Mutex<Option<Arc<Error>>>,
 	db_version: u32,
 	_lock_file: std::fs::File,
+	//phantom: PhantomData<&'inner u64>,
 }
 
 #[derive(Debug)]
@@ -234,7 +236,8 @@ impl DbInner {
 			log_worker_wait: WaitCondvar::new(),
 			commit_worker_wait: Arc::new(WaitCondvar::new()),
 			commit_overlay: RwLock::new(commit_overlay),
-			trees: RwLock::new(Default::default()),
+			trees: Default::default(),
+			trees_lock: Default::default(),
 			log_queue_wait: WaitCondvar::new(),
 			flush_worker_wait: Arc::new(WaitCondvar::new()),
 			cleanup_worker_wait: WaitCondvar::new(),
@@ -244,6 +247,7 @@ impl DbInner {
 			bg_err: Mutex::new(None),
 			db_version: metadata.version,
 			_lock_file: lock_file,
+			//phantom: PhantomData,
 		})
 	}
 
@@ -328,17 +332,17 @@ impl DbInner {
 		}
 	}
 
-	fn get_tree(
-		&self,
-		db: &Arc<DbInner>,
+	fn get_tree<'reader>(
+		&'reader self,
+		db: &'reader Arc<DbInner>,
 		col: ColId,
 		key: &[u8],
-	) -> Result<Option<Arc<TreeReader>>> {
+	) -> Result<Option<TreeReader<'reader>>> {
 		match &self.columns[col as usize] {
 			Column::Hash(column) => {
 				let key = column.hash_key(key);
 
-				let trees = self.trees.upgradable_read();
+				/* let trees = self.trees.upgradable_read();
 
 				if let Some(column_trees) = trees.get(&col) {
 					if let Some(reader) = column_trees.readers.get(&key) {
@@ -349,10 +353,10 @@ impl DbInner {
 				}
 
 				// Does the tree actually exist?
-				/* let value = self.get(col, key)?;
-				if let Some(data) = value {
-					return Ok(Some(unpack_node_data(data)?))
-				} */
+				// let value = self.get(col, key)?;
+				// if let Some(data) = value {
+				// 	return Ok(Some(unpack_node_data(data)?))
+				// }
 
 				// Didn't manage to use an existing TreeReader so will need to change trees, hence
 				// upgrade lock.
@@ -364,6 +368,74 @@ impl DbInner {
 				column_trees.readers.insert(key, Arc::downgrade(&reader));
 
 				//RwLockWriteGuard::downgrade_to_upgradable(trees);
+
+				Ok(Some(reader)) */
+
+
+
+				/* //let trees = &self.trees;//self.trees.upgradable_read();
+				let trees = &db.trees;
+
+				if let Some(column_trees) = trees.get(&col) {
+					if let Some(lock) = column_trees.readers.get(&key) {
+						//let lock = lock.clone();
+						//let lock_guard = RwLockReadGuard::map(lock.read(), |x| x);
+						let lock_guard = lock.read();
+						let reader = TreeReader { db: db.clone(), col, key/* , lock */, lock_guard };
+						return Ok(Some(reader))
+					}
+				}
+
+				Ok(None) */
+
+
+				/* let lock = {
+					let trees = db.trees.upgradable_read();
+
+					let mut l = None;
+
+					if let Some(column_trees) = trees.get(&col) {
+						if let Some(tree_lock) = column_trees.readers.get(&key) {
+							l = Some(tree_lock);
+						}
+					}
+
+					l
+				};
+
+				let lock = lock.clone();
+
+				if let Some(lock) = lock {	
+					//let lock_guard = RwLockReadGuard::map(lock.read(), |x| x);
+					let lock_guard = lock.read();
+					let reader = TreeReader { db: db.clone(), col, key/* , lock */, lock_guard };
+					return Ok(Some(reader))
+				}
+
+				Ok(None) */
+
+
+
+				let _trees_lock = db.trees_lock.upgradable_read();
+
+				if let Some(column_trees) = db.trees.get(&col) {
+					if let Some(lock) = column_trees.readers.get(&key) {
+						//let lock = lock.clone();
+						//let lock_guard = RwLockReadGuard::map(lock.read(), |x| x);
+						let lock_guard = lock.read();
+						let reader = TreeReader { db: db.clone(), col, key/* , lock */, lock_guard };
+						return Ok(Some(reader))
+					}
+				}
+
+				let mut _trees_lock = RwLockUpgradableReadGuard::upgrade(_trees_lock);
+
+				let column_trees =
+					self.trees.entry(col).or_insert_with(|| Trees { readers: Default::default() });
+				let lock = Arc::new(RwLock::new(0u64));
+				let lock_guard = lock.read();
+				let reader = TreeReader { db: db.clone(), col, key/* , lock */, lock_guard };
+				column_trees.readers.insert(key, lock);
 
 				Ok(Some(reader))
 			},
@@ -1100,7 +1172,7 @@ impl Db {
 		self.inner.btree_iter(col)
 	}
 
-	pub fn get_tree(&self, col: ColId, key: &[u8]) -> Result<Option<Arc<TreeReader>>> {
+	pub fn get_tree(&self, col: ColId, key: &[u8]) -> Result<Option<TreeReader>> {
 		self.inner.get_tree(&self.inner, col, key)
 	}
 
@@ -1367,13 +1439,15 @@ impl Db {
 	}
 }
 
-pub struct TreeReader {
+pub struct TreeReader<'reader> {
 	db: Arc<DbInner>,
 	col: ColId,
 	key: Key,
+	//lock: Arc<RwLock<u64>>,
+	lock_guard: RwLockReadGuard<'reader, u64>,
 }
 
-impl TreeReader {
+impl<'reader> TreeReader<'reader> {
 	pub fn get_root(&self) -> Result<Option<(Vec<u8>, Children)>> {
 		/* let value = self.db.get(self.col, &self.key)?;
 		if let Some(data) = value {

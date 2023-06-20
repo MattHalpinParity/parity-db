@@ -330,7 +330,7 @@ fn iter_children(
 	depth: u32,
 	generated_children: &mut Vec<u64>,
 	database_children: &mut Vec<u64>,
-	reader: &Arc<TreeReader>,
+	reader: &TreeReader,
 	chain_generator: &ChainGenerator,
 ) {
 	for i in 0..generated_children.len() {
