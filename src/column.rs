@@ -4,9 +4,10 @@
 use crate::{
 	btree::BTreeTable,
 	compress::Compress,
-	db::{check::CheckDisplay, NodeChange, Operation, RcValue},
+	db::{check::CheckDisplay, NodeChange, Operation, RcValue, TreeReader},
 	display::hex,
 	error::{try_io, Error, Result},
+	hash::IdentityBuildHasher,
 	index::{Address, IndexTable, PlanOutcome, TableId as IndexTableId},
 	log::{Log, LogAction, LogOverlays, LogQuery, LogReader, LogWriter},
 	multitree::{Children, NewNode, NodeAddress, NodeRef},
@@ -25,7 +26,7 @@ use std::{
 	path::PathBuf,
 	sync::{
 		atomic::{AtomicU64, Ordering},
-		Arc,
+		Arc, Weak,
 	},
 };
 
@@ -99,6 +100,13 @@ struct Reindex {
 	progress: AtomicU64,
 }
 
+#[derive(Debug)]
+pub struct Trees {
+	pub readers: HashMap<Key, Weak<RwLock<Box<dyn TreeReader + Send + Sync>>>, IdentityBuildHasher>,
+	/// Number of queued dereferences for each tree
+	pub to_dereference: HashMap<Key, usize>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Column {
@@ -111,6 +119,7 @@ pub struct HashColumn {
 	col: ColId,
 	tables: RwLock<Tables>,
 	reindex: RwLock<Reindex>,
+	trees: Option<RwLock<Trees>>,
 	ref_count_cache: Option<RwLock<HashMap<u64, u64>>>,
 	path: PathBuf,
 	preimage: bool,
@@ -303,6 +312,36 @@ impl HashColumn {
 			compression: &self.compression,
 		}
 	}
+
+	pub fn get_trees(&self) -> Option<RwLock<Trees>> {
+		self.trees
+	}
+
+	pub fn get_tree(&self, key: &[u8]) -> Result<Option<Arc<RwLock<Box<dyn TreeReader + Send + Sync>>>>> {
+		if let Some(trees) = self.trees {
+			let hash_key = self.hash_key(key);
+
+			let column_trees = trees.upgradable_read();
+
+			if let Some(reader) = column_trees.readers.get(&hash_key) {
+				let reader = reader.upgrade();
+				if let Some(reader) = reader {
+					return Ok(Some(reader))
+				}
+			}
+
+			let mut column_trees = RwLockUpgradableReadGuard::upgrade(column_trees);
+
+			let reader: Box<dyn TreeReader + Send + Sync> =
+				Box::new(DbTreeReader { db: db.clone(), col, key: hash_key });
+			let reader = Arc::new(RwLock::new(reader));
+
+			column_trees.readers.insert(hash_key, Arc::downgrade(&reader));
+
+			Ok(Some(reader))
+		}
+		Err(Error::InvalidConfiguration("Missing trees.".to_string()))
+	}
 }
 
 impl Column {
@@ -438,6 +477,11 @@ impl HashColumn {
 		let path = &options.path;
 		let col_options = &metadata.columns[col as usize];
 		let db_version = metadata.version;
+		let trees = if col_options.multitree {
+			Some(RwLock::new(Trees { readers: Default::default(), to_dereference: Default::default() }))
+		} else {
+			None
+		};
 		let (ref_count, ref_count_cache) = if col_options.multitree && !col_options.append_only {
 			(
 				Some(Self::open_ref_count(&options.path, col, &mut reindexing)?),
@@ -450,6 +494,7 @@ impl HashColumn {
 			col,
 			tables: RwLock::new(Tables { index, value, ref_count }),
 			reindex: RwLock::new(Reindex { queue: reindexing, progress: AtomicU64::new(0) }),
+			trees,
 			ref_count_cache,
 			path: path.into(),
 			preimage: col_options.preimage,

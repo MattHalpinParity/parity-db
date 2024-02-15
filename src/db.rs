@@ -21,7 +21,7 @@
 use crate::{
 	btree::{commit_overlay::BTreeChangeSet, BTreeIterator, BTreeTable},
 	column::{
-		hash_key, unpack_node_data, ColId, Column, HashColumn, IterState, ReindexBatch,
+		hash_key, unpack_node_data, ColId, Column, HashColumn, IterState, ReindexBatch, Trees,
 		ValueIterState,
 	},
 	error::{try_io, Error, Result},
@@ -43,7 +43,7 @@ use std::{
 	ops::Bound,
 	sync::{
 		atomic::{AtomicBool, AtomicU64, Ordering},
-		Arc, Weak,
+		Arc,
 	},
 	thread,
 };
@@ -137,13 +137,6 @@ struct CommitQueue {
 }
 
 #[derive(Debug)]
-struct Trees {
-	readers: HashMap<Key, Weak<RwLock<Box<dyn TreeReader + Send + Sync>>>, IdentityBuildHasher>,
-	/// Number of queued dereferences for each tree
-	to_dereference: HashMap<Key, usize>,
-}
-
-#[derive(Debug)]
 struct DbInner {
 	columns: Vec<Column>,
 	options: Options,
@@ -155,7 +148,7 @@ struct DbInner {
 	commit_worker_wait: Arc<WaitCondvar<bool>>,
 	// Overlay of most recent values in the commit queue.
 	commit_overlay: RwLock<Vec<CommitOverlay>>,
-	trees: RwLock<HashMap<ColId, Trees>>,
+	//trees: RwLock<HashMap<ColId, Trees>>,
 	// This may underflow occasionally, but is bound for 0 eventually.
 	log_queue_wait: WaitCondvar<i64>,
 	flush_worker_wait: Arc<WaitCondvar<bool>>,
@@ -240,7 +233,7 @@ impl DbInner {
 			log_worker_wait: WaitCondvar::new(),
 			commit_worker_wait: Arc::new(WaitCondvar::new()),
 			commit_overlay: RwLock::new(commit_overlay),
-			trees: RwLock::new(Default::default()),
+			//trees: RwLock::new(Default::default()),
 			log_queue_wait: WaitCondvar::new(),
 			flush_worker_wait: Arc::new(WaitCondvar::new()),
 			cleanup_worker_wait: WaitCondvar::new(),
