@@ -752,6 +752,7 @@ impl HashColumn {
 					Ok(PlanOutcome::Skipped)
 				},
 				Operation::InsertTree(..) |
+				Operation::InsertAndOptimizeTree(..) |
 				Operation::ReferenceTree(..) |
 				Operation::DereferenceTree(..) =>
 					Err(Error::InvalidConfiguration("Unsupported operation on hash column".into())),
@@ -1134,7 +1135,7 @@ impl HashColumn {
 		change: &Operation<Value, Value>,
 	) -> Result<(Vec<u8>, Vec<NodeChange>)> {
 		match change {
-			Operation::InsertTree(_key, node) => {
+			Operation::InsertTree(_key, node) | Operation::InsertAndOptimizeTree(_key, node)=> {
 				let tables = self.tables.upgradable_read();
 
 				let values = self.as_ref(&tables.value);
@@ -1178,6 +1179,236 @@ impl HashColumn {
 					self.col
 				))),
 		}
+	}
+
+	fn count_children(
+		&self,
+		children: &Vec<NodeRef>,
+		values: &Vec<(&u64, &RcValue, bool)>,
+		tables: TablesRef,
+		value_index: &mut u64,
+		tier_count: &mut HashMap<usize, usize>,
+	) -> Result<()> {
+		for child in children {
+			match child {
+				NodeRef::New(node) => self.count_node(node, values, tables, value_index, tier_count)?,
+				NodeRef::Existing(_address) => {},
+			};
+		}
+		Ok(())
+	}
+
+	fn count_node(
+		&self,
+		node: &NewNode,
+		values: &Vec<(&u64, &RcValue, bool)>,
+		tables: TablesRef,
+		value_index: &mut u64,
+		tier_count: &mut HashMap<usize, usize>,
+	) -> Result<()> {
+		self.count_children(&node.children, values, tables, value_index, tier_count)?;
+
+		let data_size = packed_node_size(&node.data, node.children.len() as u8);
+		assert_eq!(data_size, values[*value_index as usize].1.value().len());
+
+		if values[*value_index as usize].2 {
+			let table_key = TableKey::NoHash;
+	
+			let target_tier = tables
+				.tables
+				.iter()
+				.position(|t| t.value_size(&table_key).map_or(false, |s| data_size <= s as usize));
+			let target_tier = target_tier.unwrap_or_else(|| tables.tables.len() - 1);
+	
+			// Check it isn't multipart
+			//assert!(target_tier < (SIZE_TIERS - 1));
+	
+			match tier_count.entry(target_tier) {
+				std::collections::hash_map::Entry::Occupied(mut entry) => {
+					*entry.get_mut() += 1;
+				},
+				std::collections::hash_map::Entry::Vacant(entry) => {
+					entry.insert(1);
+				},
+			}	
+		}
+
+		*value_index += 1;
+
+		Ok(())
+	}
+
+	fn write_children_to_data(
+		&self,
+		children: &Vec<NodeRef>,
+		values: &Vec<(&u64, &RcValue, bool)>,
+		tables: TablesRef,
+		value_index: &mut u64,
+		tier_addresses: &HashMap<usize, Vec<u64>>,
+		tier_index: &mut HashMap<usize, usize>,
+		node_values: &mut Vec<NodeChange>,
+		data: &mut Vec<u8>,
+		log: &mut LogWriter,
+	) -> Result<()> {
+		for child in children {
+			let address = match child {
+				NodeRef::New(node) =>
+					self.write_node(node, values, tables, value_index, tier_addresses, tier_index, node_values, log)?,
+				NodeRef::Existing(address) => {
+					*address
+				},
+			};
+			data.extend_from_slice(&address.to_le_bytes());
+		}
+		Ok(())
+	}
+
+	fn write_node(
+		&self,
+		node: &NewNode,
+		values: &Vec<(&u64, &RcValue, bool)>,
+		tables: TablesRef,
+		value_index: &mut u64,
+		tier_addresses: &HashMap<usize, Vec<u64>>,
+		tier_index: &mut HashMap<usize, usize>,
+		node_values: &mut Vec<NodeChange>,
+		log: &mut LogWriter,
+	) -> Result<NodeAddress> {
+		let num_children = node.children.len();
+
+		let data_size = packed_node_size(&node.data, num_children as u8);
+
+		let mut data: Vec<u8> = Vec::with_capacity(data_size);
+		data.extend_from_slice(&node.data);
+		self.write_children_to_data(
+			&node.children,
+			values,
+			tables,
+			value_index,
+			tier_addresses,
+			tier_index,
+			node_values,
+			&mut data,
+			log,
+		)?;
+		data.push(num_children as u8);
+
+		assert_eq!(data_size, values[*value_index as usize].1.value().len());
+
+		// Can't support compression as we need to know the size earlier to get the tier.
+		let val: RcValue = data.into();
+
+		let existing_address = Address::from_u64(*values[*value_index as usize].0);
+
+		let address = if values[*value_index as usize].2 {
+			let table_key = TableKey::NoHash;
+
+			let target_tier = tables
+				.tables
+				.iter()
+				.position(|t| t.value_size(&table_key).map_or(false, |s| data_size <= s as usize));
+			let target_tier = target_tier.unwrap_or_else(|| tables.tables.len() - 1);
+
+			assert_eq!(target_tier, existing_address.size_tier() as usize);
+
+			let index = *tier_index.get(&target_tier).unwrap();
+			tier_index.insert(target_tier, index + 1);
+	
+			let offset = tier_addresses.get(&target_tier).unwrap()[index];
+
+			let address = Address::new(offset, target_tier as u8);
+
+			address
+		} else {
+			existing_address
+		};
+
+		*value_index += 1;
+
+		if address == existing_address {
+			let target_tier = address.size_tier();
+			let offset = address.offset();
+			/* tables.tables[target_tier as usize].write_replace_plan(
+				offset,
+				&TableKey::NoHash,
+				val.as_ref(),
+				log,
+				false,
+			)?; */
+			tables.tables[target_tier as usize].write_claimed_plan(
+				offset,
+				&TableKey::NoHash,
+				val.as_ref(),
+				log,
+				false,
+			)?;
+		} else {
+			let target_tier = address.size_tier();
+			let offset = address.offset();
+			tables.tables[target_tier as usize].write_claimed_plan(
+				offset,
+				&TableKey::NoHash,
+				val.as_ref(),
+				log,
+				false,
+			)?;
+		}
+
+		node_values.push(NodeChange::NewValue(address.as_u64(), val));
+
+		Ok(address.as_u64())
+	}
+
+	// values is: (existing address, existing value, can move)
+	pub fn write_tree_plan(
+		&self,
+		key: &Key,
+		node: &NewNode,
+		values: &Vec<(&u64, &RcValue, bool)>,
+		log: &mut LogWriter,
+	) -> Result<(PlanOutcome, RcValue, Vec<NodeChange>)> {
+		let tables_guard = self.tables.upgradable_read();
+		let tables = self.as_ref(&tables_guard.value);
+
+		let mut value_index = 0;
+		let mut tier_count: HashMap<usize, usize> = Default::default();
+		self.count_children(&node.children, values, tables, &mut value_index, &mut tier_count)?;
+
+		let mut tier_addresses: HashMap<usize, Vec<u64>> = Default::default();
+		let mut tier_index: HashMap<usize, usize> = Default::default();
+		for (tier, count) in tier_count {
+			let offsets = tables.tables[tier].get_contiguous_free_entries(count, log)?;
+			tier_addresses.insert(tier, offsets);
+			tier_index.insert(tier, 0);
+		}
+
+		let mut node_values: Vec<NodeChange> = Default::default();
+
+		let num_children = node.children.len();
+		let data_size = packed_node_size(&node.data, num_children as u8);
+		let mut data: Vec<u8> = Vec::with_capacity(data_size);
+		data.extend_from_slice(&node.data);
+		value_index = 0;
+		self.write_children_to_data(
+			&node.children,
+			values,
+			tables,
+			&mut value_index,
+			&tier_addresses,
+			&mut tier_index,
+			&mut node_values,
+			&mut data,
+			log,
+		)?;
+		data.push(num_children as u8);
+
+		drop(tables_guard);
+
+		let val: RcValue = data.into();
+
+		self.write_plan(&Operation::Set(*key, val.clone()), log)?;
+
+		Ok((PlanOutcome::Written, val, node_values))
 	}
 
 	pub fn write_address_value_plan(
@@ -2005,6 +2236,7 @@ impl Column {
 				}
 			},
 			Operation::InsertTree(..) |
+			Operation::InsertAndOptimizeTree(..) |
 			Operation::ReferenceTree(..) |
 			Operation::DereferenceTree(..) =>
 				Err(Error::InvalidInput(format!("Invalid operation for column {}", tables.col))),

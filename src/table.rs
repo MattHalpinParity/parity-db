@@ -987,6 +987,15 @@ impl ValueTable {
 		Ok(())
 	}
 
+	pub fn get_contiguous_free_entries(&self, num: usize, log: &mut LogWriter) -> Result<Vec<u64>> {
+		let mut entries: Vec<u64> = Default::default();
+		for _i in 0..num {
+			let index = self.next_free(log)?;
+			entries.push(index);
+		}
+		Ok(entries)
+	}
+
 	pub fn write_inc_ref(&self, index: u64, log: &mut LogWriter) -> Result<()> {
 		self.change_ref(index, 1, log)?;
 		Ok(())

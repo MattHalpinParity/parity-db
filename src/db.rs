@@ -31,7 +31,7 @@ use crate::{
 	multitree::{Children, NewNode, NodeAddress},
 	options::{Options, CURRENT_VERSION},
 	parking_lot::{
-		Condvar, Mutex, MutexGuard, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard,
+		Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 	},
 	stats::StatSummary,
 	ColumnOptions, Key,
@@ -141,6 +141,7 @@ struct Trees {
 	readers: HashMap<Key, Weak<RwLock<Box<dyn TreeReader + Send + Sync>>>, IdentityBuildHasher>,
 	/// Number of queued dereferences for each tree
 	to_dereference: HashMap<Key, usize>,
+	to_optimize: HashSet<Key>,
 }
 
 #[derive(Debug)]
@@ -156,6 +157,8 @@ struct DbInner {
 	// Overlay of most recent values in the commit queue.
 	commit_overlay: RwLock<Vec<CommitOverlay>>,
 	trees: RwLock<HashMap<ColId, Trees>>,
+	trees_read: RwLock<u32>,
+	discarded_addresses: RwLock<HashMap<ColId, Vec<u64>>>,
 	// This may underflow occasionally, but is bound for 0 eventually.
 	log_queue_wait: WaitCondvar<i64>,
 	flush_worker_wait: Arc<WaitCondvar<bool>>,
@@ -241,6 +244,8 @@ impl DbInner {
 			commit_worker_wait: Arc::new(WaitCondvar::new()),
 			commit_overlay: RwLock::new(commit_overlay),
 			trees: RwLock::new(Default::default()),
+			trees_read: RwLock::new(0),
+			discarded_addresses: RwLock::new(Default::default()),
 			log_queue_wait: WaitCondvar::new(),
 			flush_worker_wait: Arc::new(WaitCondvar::new()),
 			cleanup_worker_wait: WaitCondvar::new(),
@@ -411,6 +416,10 @@ impl DbInner {
 		}
 	}
 
+	fn read_trees(&self) -> Result<RwLockReadGuard<u32>> {
+		Ok(self.trees_read.read())
+	}
+
 	fn get_tree(
 		&self,
 		db: &Arc<DbInner>,
@@ -434,7 +443,7 @@ impl DbInner {
 
 				let hash_key = column.hash_key(key);
 
-				let trees = self.trees.upgradable_read();
+				let trees = self.trees.read();
 
 				if let Some(column_trees) = trees.get(&col) {
 					if let Some(reader) = column_trees.readers.get(&hash_key) {
@@ -445,11 +454,14 @@ impl DbInner {
 					}
 				}
 
-				let mut trees = RwLockUpgradableReadGuard::upgrade(trees);
+				drop(trees);
+
+				let mut trees = self.trees.write();
 
 				let column_trees = trees.entry(col).or_insert_with(|| Trees {
 					readers: Default::default(),
 					to_dereference: Default::default(),
+					to_optimize: Default::default(),
 				});
 
 				let reader: Box<dyn TreeReader + Send + Sync> =
@@ -515,9 +527,10 @@ impl DbInner {
 								return Err(Error::InvalidConfiguration(
 									"Invalid operation for multitree column".to_string(),
 								)),
-							Operation::InsertTree(..) => {
+							Operation::InsertTree(..) | Operation::InsertAndOptimizeTree(..) => {
 								let (root_data, node_values) = column.claim_tree_values(&change)?;
 
+								let mut uses_to_optimize = false;
 								let trees = self.trees.read();
 								if let Some(column_trees) = trees.get(&col) {
 									for (hash, count) in &column_trees.to_dereference {
@@ -542,8 +555,47 @@ impl DbInner {
 												.insert(*hash);
 										}
 									}
+									for hash in &column_trees.to_optimize {
+										// Check if TreeReader is active for this tree
+										let mut tree_active = false;
+										if let Some(reader) = column_trees.readers.get(hash) {
+											let reader = reader.upgrade();
+											if let Some(reader) = reader {
+												if reader.is_locked() {
+													tree_active = true;
+												}
+											}
+										}
+										if tree_active {
+											uses_to_optimize = true;
+											commit
+												.indexed
+												.entry(col)
+												.or_insert_with(|| IndexedChangeSet::new(col))
+												.used_trees
+												.insert(*hash);
+										}
+									}
 								}
 								drop(trees);
+
+								/* if uses_to_optimize */ {
+									let incremented_addresses = &mut commit.indexed
+										.entry(col)
+										.or_insert_with(|| IndexedChangeSet::new(col))
+										.incremented_addresses;
+
+									for node_change in node_values.iter() {
+										match node_change {
+											NodeChange::IncrementReference(address) => {
+												incremented_addresses.insert(*address);
+											},
+											_ => {},
+										}
+									}
+								}
+
+								let root_children = unpack_node_children(&root_data)?;
 
 								let root_operation = Operation::Set(change.key(), root_data);
 								commit
@@ -552,12 +604,57 @@ impl DbInner {
 									.or_insert_with(|| IndexedChangeSet::new(col))
 									.push(root_operation, &self.options, self.db_version)?;
 
+								let optimize = if let Operation::InsertAndOptimizeTree(key, node) = change {
+									let salt = self.options.salt.unwrap_or_default();
+									let hash = hash_key(
+										&key,
+										&salt,
+										self.options.columns[col as usize].uniform,
+										self.db_version,
+									);
+
+									let mut trees = self.trees.write();
+
+									let column_trees = trees.entry(col).or_insert_with(|| Trees {
+										readers: Default::default(),
+										to_dereference: Default::default(),
+										to_optimize: Default::default(),
+									});
+									column_trees.to_optimize.insert(hash);
+
+									drop(trees);
+									
+									commit
+										.indexed
+										.entry(col)
+										.or_insert_with(|| IndexedChangeSet::new(col))
+										.new_trees
+										.insert(hash);
+
+									commit
+										.indexed
+										.entry(col)
+										.or_insert_with(|| IndexedChangeSet::new(col))
+										.push_node_change(NodeChange::BeginInsertAndOptimize(key, hash, node, root_children));
+									true
+								} else {
+									false
+								};
+
 								for node_change in node_values {
 									commit
 										.indexed
 										.entry(col)
 										.or_insert_with(|| IndexedChangeSet::new(col))
 										.push_node_change(node_change);
+								}
+
+								if optimize {
+									commit
+										.indexed
+										.entry(col)
+										.or_insert_with(|| IndexedChangeSet::new(col))
+										.push_node_change(NodeChange::EndInsertAndOptimize());
 								}
 							},
 							Operation::ReferenceTree(..) => {
@@ -591,12 +688,38 @@ impl DbInner {
 									let column_trees = trees.entry(col).or_insert_with(|| Trees {
 										readers: Default::default(),
 										to_dereference: Default::default(),
+										to_optimize: Default::default(),
 									});
 									let count =
 										column_trees.to_dereference.get(&hash).unwrap_or(&0) + 1;
 									column_trees.to_dereference.insert(hash, count);
 
 									drop(trees);
+
+									/* let trees = self.trees.read();
+									if let Some(column_trees) = trees.get(&col) {
+										for hash in &column_trees.to_optimize {
+											// Check if TreeReader is active for this tree
+											let mut tree_active = false;
+											if let Some(reader) = column_trees.readers.get(hash) {
+												let reader = reader.upgrade();
+												if let Some(reader) = reader {
+													if reader.is_locked() {
+														tree_active = true;
+													}
+												}
+											}
+											if tree_active {
+												commit
+													.indexed
+													.entry(col)
+													.or_insert_with(|| IndexedChangeSet::new(col))
+													.used_trees
+													.insert(*hash);
+											}
+										}
+									}
+									drop(trees); */
 
 									commit.check_for_deferral = true;
 
@@ -639,7 +762,14 @@ impl DbInner {
 		let might_wait_because_the_queue_is_full = true;
 		if might_wait_because_the_queue_is_full && queue.bytes > MAX_COMMIT_QUEUE_BYTES {
 			log::debug!(target: "parity-db", "Waiting, queue size={}", queue.bytes);
-			self.commit_queue_full_cv.wait(&mut queue);
+			//self.commit_queue_full_cv.wait(&mut queue);
+
+			let mut discarded_addresses = self.discarded_addresses.write();
+			for (c, indexed) in &commit.indexed {
+				let discarded_addresses = discarded_addresses.entry(*c).or_insert_with(|| Default::default());
+				indexed.commit_failed(discarded_addresses)?;
+			}
+			return Err(Error::CommitFailed)
 		}
 
 		{
@@ -876,11 +1006,30 @@ impl DbInner {
 				commit.bytes,
 			);
 			let mut ops: u64 = 0;
-			for (c, key_values) in commit.changeset.indexed.iter() {
+
+			let mut discarded_addresses = self.discarded_addresses.write();
+			for (c, discarded_addresses) in discarded_addresses.iter() {
+				let column = &self.columns[*c as usize];
+				match column {
+					Column::Hash(column) => {
+						for address in discarded_addresses {
+							let (remains, _outcome) = column.write_address_dec_ref_plan(*address, &mut writer)?;
+							assert!(!remains);	
+						}		
+					},
+					Column::Tree(_) => {
+					},
+				};
+			}
+			discarded_addresses.clear();
+			drop(discarded_addresses);
+
+			for (c, key_values) in commit.changeset.indexed.iter_mut() {
 				key_values.write_plan(
 					db,
 					*c,
 					&self.columns[*c as usize],
+					commit.id,
 					&mut writer,
 					&mut ops,
 					&mut reindex,
@@ -896,6 +1045,18 @@ impl DbInner {
 					Column::Tree(column) => {
 						btree.write_plan(column, &mut writer, &mut ops)?;
 					},
+				}
+			}
+
+			for (col, key_values) in commit.changeset.indexed.iter() {
+				for change in &key_values.node_changes {
+					if let NodeChange::BeginInsertAndOptimize(_key, hash, _node, _children) = change {
+						let mut trees = self.trees.write();
+						if let Some(column_trees) = trees.get_mut(&col) {
+							let existed = column_trees.to_optimize.remove(hash);
+							assert!(existed);
+						}
+					}
 				}
 			}
 
@@ -1515,6 +1676,10 @@ impl Db {
 		self.inner.btree_iter(col)
 	}
 
+	pub fn read_trees(&self) -> Result<RwLockReadGuard<u32>> {
+		self.inner.read_trees()
+	}
+
 	pub fn get_tree(
 		&self,
 		col: ColId,
@@ -1997,6 +2162,9 @@ pub enum Operation<Key, Value> {
 	/// Insert a new tree into a MultiTree column using root key and node structure.
 	InsertTree(Key, NewNode),
 
+	/// Insert a new tree into a MultiTree column using root key and node structure. Once inserted, optimize for node coherence.
+	InsertAndOptimizeTree(Key, NewNode),
+
 	/// Increment the reference count of a tree (at root Key) from a MultiTree column.
 	ReferenceTree(Key),
 
@@ -2024,6 +2192,7 @@ impl<Key, Value> Operation<Key, Value> {
 			Operation::Dereference(k) |
 			Operation::Reference(k) |
 			Operation::InsertTree(k, _) |
+			Operation::InsertAndOptimizeTree(k, _) |
 			Operation::ReferenceTree(k) |
 			Operation::DereferenceTree(k) => k,
 		}
@@ -2035,6 +2204,7 @@ impl<Key, Value> Operation<Key, Value> {
 			Operation::Dereference(k) |
 			Operation::Reference(k) |
 			Operation::InsertTree(k, _) |
+			Operation::InsertAndOptimizeTree(k, _) |
 			Operation::ReferenceTree(k) |
 			Operation::DereferenceTree(k) => k,
 		}
@@ -2048,6 +2218,7 @@ impl<K: AsRef<[u8]>, Value> Operation<K, Value> {
 			Operation::Dereference(k) => Operation::Dereference(k.as_ref().to_vec()),
 			Operation::Reference(k) => Operation::Reference(k.as_ref().to_vec()),
 			Operation::InsertTree(k, n) => Operation::InsertTree(k.as_ref().to_vec(), n),
+			Operation::InsertAndOptimizeTree(k, n) => Operation::InsertAndOptimizeTree(k.as_ref().to_vec(), n),
 			Operation::ReferenceTree(k) => Operation::ReferenceTree(k.as_ref().to_vec()),
 			Operation::DereferenceTree(k) => Operation::DereferenceTree(k.as_ref().to_vec()),
 		}
@@ -2056,10 +2227,12 @@ impl<K: AsRef<[u8]>, Value> Operation<K, Value> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum NodeChange {
+	BeginInsertAndOptimize(Vec<u8>, Key, NewNode, Children),
 	/// (address, value)
 	NewValue(u64, RcValue),
 	/// (address)
 	IncrementReference(u64),
+	EndInsertAndOptimize(),
 	/// Dereference and remove any of the children in the tree
 	DereferenceChildren(Vec<u8>, Key, Children),
 }
@@ -2076,7 +2249,9 @@ pub struct IndexedChangeSet {
 	pub col: ColId,
 	pub changes: Vec<Operation<Key, RcValue>>,
 	pub node_changes: Vec<NodeChange>,
+	pub new_trees: HashSet<Key>,
 	pub used_trees: HashSet<Key>,
+	pub incremented_addresses: HashSet<u64>,
 }
 
 impl IndexedChangeSet {
@@ -2085,7 +2260,9 @@ impl IndexedChangeSet {
 			col,
 			changes: Default::default(),
 			node_changes: Default::default(),
+			new_trees: Default::default(),
 			used_trees: Default::default(),
+			incremented_addresses: Default::default(),
 		}
 	}
 
@@ -2105,6 +2282,7 @@ impl IndexedChangeSet {
 			Operation::Dereference(k) => Operation::Dereference(hash_key(k.as_ref())),
 			Operation::Reference(k) => Operation::Reference(hash_key(k.as_ref())),
 			Operation::InsertTree(..) |
+			Operation::InsertAndOptimizeTree(..) |
 			Operation::ReferenceTree(..) |
 			Operation::DereferenceTree(..) =>
 				return Err(Error::InvalidInput(format!(
@@ -2122,6 +2300,18 @@ impl IndexedChangeSet {
 
 	fn push_node_change(&mut self, change: NodeChange) {
 		self.node_changes.push(change);
+	}
+
+	fn commit_failed(
+		&self,
+		discarded_addresses: &mut Vec<u64>,
+	) -> Result<()> {
+		for change in self.node_changes.iter() {
+			if let NodeChange::NewValue(address, _val) = change {
+				discarded_addresses.push(*address);
+			}
+		}
+		Ok(())
 	}
 
 	fn copy_to_overlay(
@@ -2153,6 +2343,7 @@ impl IndexedChangeSet {
 					}
 				},
 				Operation::InsertTree(..) |
+				Operation::InsertAndOptimizeTree(..) |
 				Operation::ReferenceTree(..) |
 				Operation::DereferenceTree(..) =>
 					return Err(Error::InvalidInput(format!(
@@ -2171,10 +2362,11 @@ impl IndexedChangeSet {
 	}
 
 	fn write_plan(
-		&self,
+		&mut self,
 		db: &Arc<DbInner>,
 		col: ColId,
 		column: &Column,
+		record_id: u64,
 		writer: &mut crate::log::LogWriter,
 		ops: &mut u64,
 		reindex: &mut bool,
@@ -2193,8 +2385,168 @@ impl IndexedChangeSet {
 			}
 			*ops += 1;
 		}
-		for change in self.node_changes.iter() {
+		let mut new_node_changes = Vec::new();
+		let mut iterator = self.node_changes.iter();
+		while let Some(change) = iterator.next() {
 			match change {
+				NodeChange::BeginInsertAndOptimize(key, hash, node, root_children) => {
+					let _tree_guard = db.trees_read.write();
+					let tree = db.get_tree(db, col, key, false).unwrap();
+					if let Some(tree) = tree {
+						let _guard = tree.write();
+
+						// Any subsequent tree might use addresses from this tree due to referenced addresses being referenced again in subsequent trees.
+						let mut used_trees: HashSet<Key> = Default::default();
+						used_trees.insert(*hash);
+						let queue = db.commit_queue.lock();
+						for commit in &queue.commits {
+							for (change_col, change_set) in &commit.changeset.indexed {
+								if *change_col == col {
+									/* let mut commit_uses = false;
+									for used_hash in used_trees.iter() {
+										if change_set.used_trees.contains(used_hash) {
+											commit_uses = true;
+											break;
+										}	
+									} */
+									let commit_uses = true;//change_set.used_trees.contains(hash);
+
+									if commit_uses {
+										for tree in change_set.new_trees.iter() {
+											used_trees.insert(*tree);
+										}
+									}
+								}
+							}
+						}
+						drop(queue);
+
+						/* let trees_guard = db.trees.read();
+						let mut other_tree_readers = Vec::new();
+						for tree in used_trees {
+							if tree != *hash {
+								let tree_reader = db.get_tree_from_hash(db, col, &tree, &trees_guard).unwrap();
+								if let Some(tree_reader) = tree_reader {
+									other_tree_readers.push(tree_reader);
+								}
+							}
+						}
+						drop(trees_guard);
+						let mut other_guards = Vec::new();
+						for tree_reader in other_tree_readers.iter() {
+							let other_guard = tree_reader.write();
+							other_guards.push(other_guard);	
+						} */
+
+						// Addresses in this commit might be used in subsequent queued commits that don't directly use this tree.
+						// This can happen like a chain where a tree uses the next tree that uses this one.
+						// We could speculatively go through all subsequent queued commits and check every address but this is a lot.
+						// Instead look at the commits that directly use this tree and find all IncrementReference changes.
+						// Any address that is incremented should be excluded from being moved. These are the only addresses that could be used in a chain
+						// so the problem is fixed.
+						// TODO: To speed up this address matching make each commit that uses a tree in to_optimize store a HashSet of incremented addresses.
+						// Hence can quickly match up addresses here and exclude any that have been incremented by any commit that directly uses this tree.
+						let mut used = false;
+						let mut incremented_addresses: HashSet<u64> = Default::default();
+						let queue = db.commit_queue.lock();
+						'outer: for commit in &queue.commits {
+							/* for (_col, change_set) in &commit.changeset.indexed {
+								for tree in &change_set.used_trees {
+									if tree == hash {
+										used = true;
+										incremented_addresses.extend(change_set.incremented_addresses.iter());
+										//let union = incremented_addresses.union(&change_set.incremented_addresses);
+										//incremented_addresses = incremented_addresses.union(&change_set.incremented_addresses).collect();
+										break 'outer
+									}
+								}
+							} */
+							for (change_col, change_set) in &commit.changeset.indexed {
+								if *change_col == col {
+									// TODO: Should have the if statement uncommented
+									/* if change_set.used_trees.contains(hash) */ {
+										used = true;
+										incremented_addresses.extend(change_set.incremented_addresses.iter());
+										//let union = incremented_addresses.union(&change_set.incremented_addresses);
+										//incremented_addresses = incremented_addresses.union(&change_set.incremented_addresses).collect();
+										//break 'outer
+									}
+								}
+							}
+						}
+
+						for address in root_children {
+							incremented_addresses.insert(*address);
+						}
+
+						// Collect all NewValue from self.node_changes between this and the next EndInsertAndOptimize.
+						// Leave them there so they can be removed from the commit overlay in clean_overlay.
+						let mut new_values = Vec::new();
+						while let Some(value_change) = iterator.next() {
+							match value_change {
+								NodeChange::NewValue(address, val) => {
+									let can_move = !incremented_addresses.contains(address);
+									new_values.push((address, val, can_move));
+									if can_move {
+										// TODO: Shouldn't need to write this
+										/* column.write_address_value_plan(
+											*address,
+											val.clone(),
+											false,
+											val.value().len() as u32,
+											writer,
+										)?; */
+										let (remains, _outcome) = column.write_address_dec_ref_plan(*address, writer)?;
+										assert!(!remains);
+									}
+								},
+								NodeChange::IncrementReference(address) => {
+									if let PlanOutcome::NeedReindex =
+										column.write_address_inc_ref_plan(*address, writer)?
+									{
+										*reindex = true;
+									}
+								},
+								NodeChange::EndInsertAndOptimize() => {
+									break;
+								},
+								_ => {
+									return Err(Error::InvalidConfiguration("Unexpected change between BeginInsertAndOptimize and EndInsertAndOptimize".to_string()))
+								}
+							}
+						}
+
+						// NOTE: Even if a node can't be moved due to being referenced it might still need its value changed as its children might have moved.
+						let (_outcome, root_value, node_changes) = column.write_tree_plan(hash, node, &new_values, writer)?;
+
+						let mut overlay = db.commit_overlay.write();
+						if let std::collections::hash_map::Entry::Occupied(e) = overlay[col as usize].indexed.entry(*hash) {
+							assert_eq!(e.get().0, record_id);
+							if e.get().0 == record_id {
+								e.remove_entry();
+							}
+						}
+						for (address, _value, _can_move) in new_values {
+							if let std::collections::hash_map::Entry::Occupied(e) = overlay[col as usize].address.entry(*address) {
+								assert_eq!(e.get().0, record_id);
+								if e.get().0 == record_id {
+									e.remove_entry();
+								}
+							}	
+						}
+						overlay[col as usize].indexed.insert(*hash, (record_id, Some(root_value.clone())));
+						for change in node_changes.iter() {
+							if let NodeChange::NewValue(address, val) = change {
+								// *bytes += val.value().len();
+								let existing = overlay[col as usize].address.insert(*address, (record_id, val.clone()));
+								assert!(existing.is_none());
+							}
+						}
+						drop(overlay);
+
+						new_node_changes.extend(node_changes);
+					}
+				}
 				NodeChange::NewValue(address, val) => {
 					column.write_address_value_plan(
 						*address,
@@ -2204,6 +2556,9 @@ impl IndexedChangeSet {
 						writer,
 					)?;
 				},
+				NodeChange::EndInsertAndOptimize() => {
+					return Err(Error::InvalidConfiguration("Mismatched EndInsertAndOptimize".to_string()))
+				}
 				NodeChange::IncrementReference(address) => {
 					if let PlanOutcome::NeedReindex =
 						column.write_address_inc_ref_plan(*address, writer)?
@@ -2234,6 +2589,9 @@ impl IndexedChangeSet {
 					// TODO: Remove TreeReader from Db.
 				},
 			}
+		}
+		for change in new_node_changes {
+			self.node_changes.push(change);
 		}
 		Ok(())
 	}
@@ -2284,17 +2642,32 @@ impl IndexedChangeSet {
 				},
 				Operation::Reference(..) |
 				Operation::InsertTree(..) |
+				Operation::InsertAndOptimizeTree(..) |
 				Operation::ReferenceTree(..) |
 				Operation::DereferenceTree(..) => (),
 			}
 		}
+		let mut ignore = false;
 		for change in self.node_changes.iter() {
-			if let NodeChange::NewValue(address, _val) = change {
-				if let Entry::Occupied(e) = overlay.address.entry(*address) {
-					if e.get().0 == record_id {
-						e.remove_entry();
+			match change {
+				NodeChange::BeginInsertAndOptimize(..) => {
+					assert!(!ignore);
+					ignore = true;
+				},
+				NodeChange::NewValue(address, _val) => {
+					if !ignore {
+						if let Entry::Occupied(e) = overlay.address.entry(*address) {
+							if e.get().0 == record_id {
+								e.remove_entry();
+							}
+						}	
 					}
-				}
+				},
+				NodeChange::EndInsertAndOptimize() => {
+					assert!(ignore);
+					ignore = false;
+				},
+				_ => {}
 			}
 		}
 	}

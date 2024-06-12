@@ -390,6 +390,7 @@ pub mod commit_overlay {
 				Operation::Dereference(k) => Operation::Dereference(k.into()),
 				Operation::Reference(k) => Operation::Reference(k.into()),
 				Operation::InsertTree(..) |
+				Operation::InsertAndOptimizeTree(..) |
 				Operation::ReferenceTree(..) |
 				Operation::DereferenceTree(..) =>
 					return Err(Error::InvalidInput(format!(
@@ -435,6 +436,7 @@ pub mod commit_overlay {
 						}
 					},
 					Operation::InsertTree(..) |
+					Operation::InsertAndOptimizeTree(..) |
 					Operation::ReferenceTree(..) |
 					Operation::DereferenceTree(..) =>
 						return Err(Error::InvalidInput(format!(

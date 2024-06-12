@@ -21,6 +21,7 @@ pub enum Error {
 	Migration(String),
 	Compression,
 	DatabaseNotFound,
+	CommitFailed,
 }
 
 impl fmt::Display for Error {
@@ -39,6 +40,7 @@ impl fmt::Display for Error {
 			Error::Migration(e) => write!(f, "Migration error: {e}"),
 			Error::Compression => write!(f, "Compression error"),
 			Error::DatabaseNotFound => write!(f, "Database does not exist"),
+			Error::CommitFailed => write!(f, "Commit failed"),
 		}
 	}
 }

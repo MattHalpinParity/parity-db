@@ -5,7 +5,7 @@ use super::*;
 
 mod data;
 
-pub use parity_db::{Db, Key, TreeReader};
+pub use parity_db::{Db, Error, Key, TreeReader};
 use parity_db::{NewNode, NodeRef, Operation};
 
 use parking_lot::{RwLock, RwLockReadGuard};
@@ -36,7 +36,7 @@ const KEY_LAST_COMMIT: Key = [1u8; 32];
 const KEY_NUM_REMOVED: Key = [2u8; 32];
 
 const MAX_NUM_CHILDREN: usize = 16;
-const NUM_TREES_TO_CACHE: usize = 3;
+const NUM_TREES_TO_CACHE: usize = 10;
 
 const THREAD_PRUNING: bool = true;
 const FORCE_NO_MULTIPART_VALUES: bool = true;
@@ -635,6 +635,7 @@ fn build_node_from_db<'a>(
 fn build_tree_from_db(tree_index: u64, db: &Db, chain_generator: &ChainGenerator) -> NodeData {
 	let root_seed = chain_generator.root_seed(tree_index);
 	let key = chain_generator.key(root_seed);
+	let _tree_guard = db.read_trees().unwrap();
 	match db.get_tree(TREE_COLUMN, &key).unwrap() {
 		Some(reader) => {
 			let reader = reader.read();
@@ -819,6 +820,7 @@ fn read_value(
 ) -> Result<(), String> {
 	let root_seed = chain_generator.root_seed(tree_index);
 	let key = chain_generator.key(root_seed);
+	let _tree_guard = db.read_trees().unwrap();
 	match db.get_tree(TREE_COLUMN, &key).unwrap() {
 		Some(reader) => {
 			let reader = reader.read();
@@ -896,133 +898,155 @@ fn writer(
 		let tree_index = n as u64;
 		let root_seed = chain_generator.root_seed(tree_index);
 
-		let (previous_tree_index, previous_tree) = if args.writers > 1 {
-			// Not much advantage to multiple writers. They have to work from the previous commit so
-			// just wait their turn.
-			let required_tree_index = if n == 0 { 0 } else { tree_index - 1 };
-			let mut previous_tree_index = 0;
-			let mut previous_tree = None;
-			while previous_tree.is_none() {
-				let check = if n == 1 {
-					let commits = COMMITS.load(Ordering::Relaxed);
-					commits > start_commit
-				} else {
-					true
-				};
-				if check {
-					let tree_lock = trees.read();
-					if let Some(back_tree) = tree_lock.back() {
-						if back_tree.0 == required_tree_index {
-							previous_tree_index = back_tree.0;
-							previous_tree = Some(back_tree.1.clone());
+		let mut failed = true;
+		while failed {
+			let (previous_tree_index, previous_tree) = if args.writers > 1 {
+				// Not much advantage to multiple writers. They have to work from the previous commit so
+				// just wait their turn.
+				let required_tree_index = if n == 0 { 0 } else { tree_index - 1 };
+				let mut previous_tree_index = 0;
+				let mut previous_tree = None;
+				while previous_tree.is_none() {
+					let check = if n == 1 {
+						let commits = COMMITS.load(Ordering::Relaxed);
+						commits > start_commit
+					} else {
+						true
+					};
+					if check {
+						let tree_lock = trees.read();
+						if let Some(back_tree) = tree_lock.back() {
+							if back_tree.0 == required_tree_index {
+								previous_tree_index = back_tree.0;
+								previous_tree = Some(back_tree.1.clone());
+							}
 						}
 					}
 				}
-			}
-			(previous_tree_index, previous_tree)
-		} else {
-			let tree_lock = trees.read();
-			let (previous_tree_index, previous_tree) = if let Some(previous_tree) = tree_lock.back()
-			{
-				let previous_root_node = previous_tree.1.clone();
-				(previous_tree.0, Some(previous_root_node))
+				(previous_tree_index, previous_tree)
 			} else {
-				// There should always be a cached tree
-				assert!(false);
-				(0, None)
-			};
-			(previous_tree_index, previous_tree)
-		};
-
-		if let Some(previous_tree) = previous_tree {
-			let prev_root_seed = chain_generator.root_seed(previous_tree_index);
-			let prev_key = chain_generator.key(prev_root_seed);
-
-			let reader = if n > 0 {
-				Some(match db.get_tree(TREE_COLUMN, &prev_key).unwrap() {
-					Some(r) => r,
-					None => return Err("Previous tree not found in database".to_string()),
-				})
-			} else {
-				None
+				let tree_lock = trees.read();
+				let (previous_tree_index, previous_tree) = if let Some(previous_tree) = tree_lock.back()
+				{
+					let previous_root_node = previous_tree.1.clone();
+					(previous_tree.0, Some(previous_root_node))
+				} else {
+					// There should always be a cached tree
+					assert!(false);
+					(0, None)
+				};
+				(previous_tree_index, previous_tree)
 			};
 
-			let reader_lock = reader.as_ref().map(|f| f.read());
+			if let Some(previous_tree) = previous_tree {
+				let prev_root_seed = chain_generator.root_seed(previous_tree_index);
+				let prev_key = chain_generator.key(prev_root_seed);
 
-			let (root_node_ref, tree) = if n == 0 {
-				assert_eq!(previous_tree_index, 0);
-				let root = build_initial_commit_tree(&previous_tree, &db, &chain_generator)?;
-				(root, None)
-			} else {
-				assert_eq!(previous_tree_index, tree_index - 1);
+				let tree_guard = db.read_trees().unwrap();
 
-				// Create new tree with removals and additions
-				let new_tree =
-					chain_generator.build_tree_with_changes(tree_index, &previous_tree)?;
-
-				let reader = reader_lock.as_ref().unwrap();
-
-				let prev_child_address = match reader.get_root().unwrap() {
-					Some(prev_root) => prev_root.1,
-					None => return Err("Previous root not found in database".to_string()),
+				let reader = if n > 0 {
+					Some(match db.get_tree(TREE_COLUMN, &prev_key).unwrap() {
+						Some(r) => r,
+						None => return Err("Previous tree not found in database".to_string()),
+					})
+				} else {
+					None
 				};
 
-				let root = build_commit_tree(
-					&new_tree,
-					&db,
-					&chain_generator,
-					Some(prev_child_address),
-					&reader,
-				)?;
-				(root, Some(new_tree))
-			};
+				let reader_lock = reader.as_ref().map(|f| f.read());
 
-			let mut num_existing_nodes = 0;
-			let num_new_nodes = num_new_nodes(&root_node_ref, &mut num_existing_nodes);
-			if let NodeRef::New(node) = root_node_ref {
-				let key: [u8; 32] = chain_generator.key(root_seed);
+				let (root_node_ref, tree) = if n == 0 {
+					assert_eq!(previous_tree_index, 0);
+					let root = build_initial_commit_tree(&previous_tree, &db, &chain_generator)?;
+					(root, None)
+				} else {
+					assert_eq!(previous_tree_index, tree_index - 1);
 
-				commit.push((TREE_COLUMN, Operation::InsertTree(key.to_vec(), node)));
+					// Create new tree with removals and additions
+					let new_tree =
+						chain_generator.build_tree_with_changes(tree_index, &previous_tree)?;
 
-				commit.push((
-					INFO_COLUMN,
-					Operation::Set(KEY_LAST_COMMIT.to_vec(), (n as u64).to_be_bytes().to_vec()),
-				));
+					let reader = reader_lock.as_ref().unwrap();
 
-				db.commit_changes(commit.drain(..)).unwrap();
+					let prev_child_address = match reader.get_root().unwrap() {
+						Some(prev_root) => prev_root.1,
+						None => return Err("Previous root not found in database".to_string()),
+					};
 
-				drop(reader_lock);
+					let root = build_commit_tree(
+						&new_tree,
+						&db,
+						&chain_generator,
+						Some(prev_child_address),
+						&reader,
+					)?;
+					(root, Some(new_tree))
+				};
 
-				if let Some(tree) = tree {
-					let mut tree_lock = trees.write();
-					tree_lock.push_back((tree_index, Arc::new(tree)));
-					while tree_lock.len() > NUM_TREES_TO_CACHE {
-						tree_lock.pop_front();
+				let mut num_existing_nodes = 0;
+				let num_new_nodes = num_new_nodes(&root_node_ref, &mut num_existing_nodes);
+				if let NodeRef::New(node) = root_node_ref {
+					let key: [u8; 32] = chain_generator.key(root_seed);
+
+					//commit.push((TREE_COLUMN, Operation::InsertTree(key.to_vec(), node)));
+					commit.push((TREE_COLUMN, Operation::InsertAndOptimizeTree(key.to_vec(), node)));
+
+					commit.push((
+						INFO_COLUMN,
+						Operation::Set(KEY_LAST_COMMIT.to_vec(), (n as u64).to_be_bytes().to_vec()),
+					));
+
+					failed = match db.commit_changes(commit.drain(..)) {
+						Ok(..) => false,
+						Err(error) => match error {
+							Error::CommitFailed => {
+								true
+							},
+							_ => {
+								panic!("Problem commiting tree");
+							}
+						},
+					};
+
+					drop(reader_lock);
+					drop(tree_guard);
+
+					commit.clear();
+
+					if !failed {
+						if let Some(tree) = tree {
+							let mut tree_lock = trees.write();
+							tree_lock.push_back((tree_index, Arc::new(tree)));
+							while tree_lock.len() > NUM_TREES_TO_CACHE {
+								tree_lock.pop_front();
+							}
+						}
+
+						COMMITS.fetch_add(1, Ordering::SeqCst);
+						EXPECTED_NUM_ENTRIES.fetch_add(num_new_nodes as usize, Ordering::SeqCst);
+
+						// Immediately read and check a random value from the tree
+						/* let tree_lock = trees.read();
+						if let Some(back_tree) = tree_lock.back() {
+							if back_tree.0 == tree_index {
+								let root_node = back_tree.1.clone();
+								let mut rng =
+									rand::rngs::SmallRng::seed_from_u64(args.seed.unwrap_or(0) + n as u64);
+								read_value(tree_index, &root_node, &mut rng, &db, &chain_generator)?;
+							}
+						}
+						drop(tree_lock); */
+
+						if args.pruning > 0 && !THREAD_PRUNING {
+							try_prune(&db, &args, &chain_generator, &mut commit)?;
+						}
+
+						if args.commit_time > 0 {
+							thread::sleep(std::time::Duration::from_millis(args.commit_time));
+						}
+					} else {
+						thread::sleep(std::time::Duration::from_millis(100));
 					}
-				}
-
-				COMMITS.fetch_add(1, Ordering::SeqCst);
-				EXPECTED_NUM_ENTRIES.fetch_add(num_new_nodes as usize, Ordering::SeqCst);
-				commit.clear();
-
-				// Immediately read and check a random value from the tree
-				/* let tree_lock = trees.read();
-				if let Some(back_tree) = tree_lock.back() {
-					if back_tree.0 == tree_index {
-						let root_node = back_tree.1.clone();
-						let mut rng =
-							rand::rngs::SmallRng::seed_from_u64(args.seed.unwrap_or(0) + n as u64);
-						read_value(tree_index, &root_node, &mut rng, &db, &chain_generator)?;
-					}
-				}
-				drop(tree_lock); */
-
-				if args.pruning > 0 && !THREAD_PRUNING {
-					try_prune(&db, &args, &chain_generator, &mut commit)?;
-				}
-
-				if args.commit_time > 0 {
-					thread::sleep(std::time::Duration::from_millis(args.commit_time));
 				}
 			}
 		}
@@ -1057,18 +1081,35 @@ fn try_prune(
 		let root_seed = chain_generator.root_seed(tree_index);
 		let key = chain_generator.key(root_seed);
 
-		commit.push((TREE_COLUMN, Operation::DereferenceTree(key.to_vec())));
-		commit.push((
-			INFO_COLUMN,
-			Operation::Set(
-				KEY_NUM_REMOVED.to_vec(),
-				((num_removed + 1) as u64).to_be_bytes().to_vec(),
-			),
-		));
+		let mut failed = true;
+		while failed {
+			commit.push((TREE_COLUMN, Operation::DereferenceTree(key.to_vec())));
+			commit.push((
+				INFO_COLUMN,
+				Operation::Set(
+					KEY_NUM_REMOVED.to_vec(),
+					((num_removed + 1) as u64).to_be_bytes().to_vec(),
+				),
+			));
+	
+			failed = match db.commit_changes(commit.drain(..)) {
+				Ok(..) => false,
+				Err(error) => match error {
+					Error::CommitFailed => {
+						true
+					},
+					_ => {
+						panic!("Problem commiting prune");
+					}
+				},
+			};
 
-		NUM_REMOVED.fetch_add(1, Ordering::SeqCst);
-		db.commit_changes(commit.drain(..)).unwrap();
-		commit.clear();
+			commit.clear();
+
+			if !failed {
+				NUM_REMOVED.fetch_add(1, Ordering::SeqCst);
+			}
+		}
 	}
 
 	Ok(())
@@ -1107,9 +1148,10 @@ fn reader(
 			continue
 		}
 
+		let num_new_to_skip = 0;
 		let trees = trees.read();
-		let generated_tree = if trees.len() > 0 {
-			let cached_index = rng.next_u32() as usize % trees.len();
+		let generated_tree = if trees.len() > num_new_to_skip {
+			let cached_index = rng.next_u32() as usize % (trees.len() - num_new_to_skip);
 			let gen_tree = &trees[cached_index];
 			let gen_tree_root = gen_tree.1.clone();
 			Some((gen_tree.0, gen_tree_root))
@@ -1183,6 +1225,7 @@ fn iter(
 		if let Some((tree_index, gen_root_node)) = generated_tree {
 			let root_seed = chain_generator.root_seed(tree_index);
 			let key = chain_generator.key(root_seed);
+			let _tree_guard = db.read_trees().unwrap();
 			match db.get_tree(TREE_COLUMN, &key).unwrap() {
 				Some(reader) => {
 					let reader = reader.read();
